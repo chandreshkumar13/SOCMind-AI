@@ -1,3 +1,4 @@
+<<<<<<< HEAD
 # SOCMind AI: Multi-Agent Autonomous Threat Triage & Incident Response Copilot
 
 **Academic Cybersecurity Project**  
@@ -117,3 +118,7 @@ npm run dev
 - **Team Leader**: Chandresh Kumar
 - **Team Member**: Kalpna Chaudhary
 - **Mentor**: Sachin Kumar Yadav
+=======
+# SOCMind-AI
+Multi-Agent Autonomous Threat Triage &amp; Incident Response Copilot
+>>>>>>> 855d11fe994c9952f53c61eed4d8252c6b85c15b
