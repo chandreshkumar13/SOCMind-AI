@@ -1,0 +1,38 @@
+[
+  {
+    "log_id": "LOG-1001",
+    "timestamp": "2026-09-03T08:13:50Z",
+    "host": "FINANCE-WKS-042",
+    "log_type": "WinEventLog:Security",
+    "event_id": 4688,
+    "user": "j.doe",
+    "message": "A new process has been created. Process Name: C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe, Parent Process Name: C:\\Program Files\\Microsoft Office\\root\\Office16\\EXCEL.EXE"
+  },
+  {
+    "log_id": "LOG-1002",
+    "timestamp": "2026-09-03T08:14:10Z",
+    "host": "FINANCE-WKS-042",
+    "log_type": "Sysmon",
+    "event_id": 3,
+    "user": "j.doe",
+    "message": "Network connection detected. SourceIP: 192.168.10.42, DestinationIP: 185.220.101.5, DestinationPort: 443, Image: C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe"
+  },
+  {
+    "log_id": "LOG-1003",
+    "timestamp": "2026-09-03T08:15:01Z",
+    "host": "SSH-GATEWAY-01",
+    "log_type": "Syslog",
+    "event_id": 100,
+    "user": "root",
+    "message": "Failed password for root from 198.51.100.77 port 49152 ssh2"
+  },
+  {
+    "log_id": "LOG-1004",
+    "timestamp": "2026-09-03T08:24:55Z",
+    "host": "FINANCE-WKS-042",
+    "log_type": "WinEventLog:Security",
+    "event_id": 4688,
+    "user": "j.doe",
+    "message": "Process Creation: C:\\Windows\\System32\\rundll32.exe C:\\Users\\j.doe\\AppData\\Local\\Temp\\update.dll,Start"
+  }
+]
