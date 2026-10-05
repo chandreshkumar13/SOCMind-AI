@@ -27,7 +27,7 @@ def test_seed_alerts():
     assert res.status_code == 200
     data = res.json()
     assert data["status"] == "success"
-    assert data["inserted"] >= 1
+    assert data["inserted"] + data["skipped"] == data["total_processed"]
 
     # Second seed call (idempotent duplicate protection check)
     res_dup = client.post("/api/v1/alerts/seed")

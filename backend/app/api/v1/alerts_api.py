@@ -5,9 +5,17 @@ from sqlalchemy import or_
 
 from app.db.session import get_db
 from app.models.models import AlertModel
-from app.schemas.alert import AlertIngestRequest, AlertResponse, PaginatedAlertResponse, AlertUpdateStatus
+from app.schemas.alert import (
+    AlertIngestRequest, 
+    AlertResponse, 
+    PaginatedAlertResponse, 
+    AlertUpdateStatus,
+    TriageResultResponse,
+    AlertTriageResponse
+)
 from app.services.normalization import NormalizationService
 from app.services.seed import seed_synthetic_alerts
+from app.agents.triage.triage_agent import TriageAgent
 
 router = APIRouter()
 
@@ -107,6 +115,54 @@ def get_alert_by_id(alert_id: str, db: Session = Depends(get_db)):
             detail=f"Alert with ID '{alert_id}' not found."
         )
     return alert
+
+
+@router.post("/alerts/{alert_id}/triage", response_model=AlertTriageResponse, summary="Triage an Existing Alert")
+def triage_alert(alert_id: str, db: Session = Depends(get_db)):
+    """
+    Runs deterministic TriageAgent on an existing alert, persists triage rationale/score,
+    and updates alert status to TRIAGED.
+    """
+    alert = db.query(AlertModel).filter(AlertModel.id == alert_id).first()
+    if not alert:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Alert with ID '{alert_id}' not found."
+        )
+
+    alert_dict = {
+        "id": alert.id,
+        "external_alert_id": alert.external_alert_id,
+        "timestamp": alert.timestamp.isoformat() if alert.timestamp else None,
+        "source": alert.source,
+        "alert_title": alert.alert_title,
+        "description": alert.description,
+        "severity": alert.severity,
+        "host": alert.host,
+        "username": alert.username,
+        "source_ip": alert.source_ip,
+        "destination_ip": alert.destination_ip,
+        "file_hash": alert.file_hash,
+        "command_line": alert.command_line,
+        "status": alert.status
+    }
+
+    triage_agent = TriageAgent()
+    triage_result = triage_agent.analyze_alert(alert_dict)
+
+    # Persist triage data in normalized_data JSON field
+    norm_data = dict(alert.normalized_data or {})
+    norm_data["triage"] = triage_result
+    alert.normalized_data = norm_data
+    alert.status = "TRIAGED"
+
+    db.commit()
+    db.refresh(alert)
+
+    return {
+        "alert": alert,
+        "triage_result": triage_result
+    }
 
 
 @router.delete("/alerts/{alert_id}", summary="Close or Remove Alert")

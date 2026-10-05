@@ -69,3 +69,26 @@ class PaginatedAlertResponse(BaseModel):
     items: List[AlertResponse]
     page: int
     limit: int
+
+
+class TriageResultResponse(BaseModel):
+    """
+    Structured output returned by TriageAgent.
+    """
+    agent: str
+    model_version: str
+    status: str
+    alert_id: str
+    assigned_severity: str
+    priority: str
+    suspicion_score: int
+    indicators: List[str]
+    rationale: str
+
+
+class AlertTriageResponse(BaseModel):
+    """
+    Container response for POST /api/v1/alerts/{alert_id}/triage.
+    """
+    alert: AlertResponse
+    triage_result: TriageResultResponse
