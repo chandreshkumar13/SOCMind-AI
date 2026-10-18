@@ -16,6 +16,7 @@ from app.schemas.alert import (
 from app.services.normalization import NormalizationService
 from app.services.seed import seed_synthetic_alerts
 from app.agents.triage.triage_agent import TriageAgent
+from app.agents.enrichment.enrichment_agent import EnrichmentAgent
 
 router = APIRouter()
 
@@ -162,6 +163,54 @@ def triage_alert(alert_id: str, db: Session = Depends(get_db)):
     return {
         "alert": alert,
         "triage_result": triage_result
+    }
+
+
+@router.post("/alerts/{alert_id}/enrich", summary="Enrich Alert with IOC Threat Intelligence (Phase 3.2)")
+def enrich_alert(alert_id: str, db: Session = Depends(get_db)):
+    """
+    Phase 3.2 — IOC Extraction & Threat Intelligence Enrichment.
+
+    Extracts all Indicators of Compromise (IPs, hashes, domains, URLs) from
+    the stored alert's structured and free-text fields, queries mock threat
+    intelligence, and persists the enrichment result.
+    """
+    alert = db.query(AlertModel).filter(AlertModel.id == alert_id).first()
+    if not alert:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Alert with ID '{alert_id}' not found."
+        )
+
+    alert_dict = {
+        "id": alert.id,
+        "alert_title": alert.alert_title,
+        "alert_name": alert.alert_title,
+        "description": alert.description,
+        "severity": alert.severity,
+        "source_ip": alert.source_ip,
+        "destination_ip": alert.destination_ip,
+        "file_hash": alert.file_hash,
+        "command_line": alert.command_line,
+        "username": alert.username,
+        "host": alert.host,
+    }
+
+    enrichment_agent = EnrichmentAgent(mock_mode=True)
+    enrichment_result = enrichment_agent.enrich_alert(alert_dict)
+
+    # Persist enrichment result in normalized_data JSON field
+    norm_data = dict(alert.normalized_data or {})
+    norm_data["enrichment"] = enrichment_result
+    alert.normalized_data = norm_data
+    alert.status = "ENRICHED"
+
+    db.commit()
+    db.refresh(alert)
+
+    return {
+        "alert": alert,
+        "enrichment_result": enrichment_result
     }
 
 
