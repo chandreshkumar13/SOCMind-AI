@@ -16,7 +16,7 @@ def health_check():
         "app_name": settings.PROJECT_NAME,
         "environment": settings.ENVIRONMENT,
         "debug": settings.DEBUG,
-        "database": settings.DATABASE_URL
+        "database": settings.DATABASE_URL.split(":")[0]  # engine type only; never expose the URL
     }
 
 

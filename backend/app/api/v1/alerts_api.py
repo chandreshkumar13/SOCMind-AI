@@ -15,7 +15,8 @@ from app.schemas.alert import (
 )
 from app.services.normalization import NormalizationService
 from app.services.seed import seed_synthetic_alerts
-from app.agents.triage.triage_agent import TriageAgent
+from app.services.audit import log_action
+from app.services.pipeline_steps import triage_alert_record, enrich_alert_record
 
 router = APIRouter()
 
@@ -56,6 +57,8 @@ def ingest_alert(payload: AlertIngestRequest, db: Session = Depends(get_db)):
     )
 
     db.add(alert_record)
+    log_action(db, "API", "ALERT_INGESTED", normalized["id"],
+               {"source": normalized["source"], "severity": normalized["severity"]})
     db.commit()
     db.refresh(alert_record)
 
@@ -130,31 +133,8 @@ def triage_alert(alert_id: str, db: Session = Depends(get_db)):
             detail=f"Alert with ID '{alert_id}' not found."
         )
 
-    alert_dict = {
-        "id": alert.id,
-        "external_alert_id": alert.external_alert_id,
-        "timestamp": alert.timestamp.isoformat() if alert.timestamp else None,
-        "source": alert.source,
-        "alert_title": alert.alert_title,
-        "description": alert.description,
-        "severity": alert.severity,
-        "host": alert.host,
-        "username": alert.username,
-        "source_ip": alert.source_ip,
-        "destination_ip": alert.destination_ip,
-        "file_hash": alert.file_hash,
-        "command_line": alert.command_line,
-        "status": alert.status
-    }
-
-    triage_agent = TriageAgent()
-    triage_result = triage_agent.analyze_alert(alert_dict)
-
-    # Persist triage data in normalized_data JSON field
-    norm_data = dict(alert.normalized_data or {})
-    norm_data["triage"] = triage_result
-    alert.normalized_data = norm_data
-    alert.status = "TRIAGED"
+    # Stores the triage result and audits it. A CLOSED alert keeps its status (it is never re-opened).
+    triage_result = triage_alert_record(db, alert)
 
     db.commit()
     db.refresh(alert)
@@ -162,6 +142,34 @@ def triage_alert(alert_id: str, db: Session = Depends(get_db)):
     return {
         "alert": alert,
         "triage_result": triage_result
+    }
+
+
+@router.post("/alerts/{alert_id}/enrich", summary="Enrich Alert with IOC Threat Intelligence (Phase 3.2)")
+def enrich_alert(alert_id: str, db: Session = Depends(get_db)):
+    """
+    Phase 3.2 — IOC Extraction & Threat Intelligence Enrichment.
+
+    Extracts all Indicators of Compromise (IPs, hashes, domains, URLs) from
+    the stored alert's structured and free-text fields, queries mock threat
+    intelligence, and persists the enrichment result.
+    """
+    alert = db.query(AlertModel).filter(AlertModel.id == alert_id).first()
+    if not alert:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Alert with ID '{alert_id}' not found."
+        )
+
+    # Stores the enrichment result and audits it. A CLOSED alert keeps its status.
+    enrichment_result = enrich_alert_record(db, alert)
+
+    db.commit()
+    db.refresh(alert)
+
+    return {
+        "alert": alert,
+        "enrichment_result": enrichment_result
     }
 
 
@@ -178,6 +186,7 @@ def delete_alert(alert_id: str, db: Session = Depends(get_db)):
         )
 
     alert.status = "CLOSED"
+    log_action(db, "API", "ALERT_CLOSED", alert_id)
     db.commit()
 
     return {
@@ -193,4 +202,7 @@ def seed_alerts(db: Session = Depends(get_db)):
     Populates database with 10 synthetic test alerts. Idempotent check prevents duplicates.
     """
     result = seed_synthetic_alerts(db)
+    if result.get("status") == "success" and result.get("inserted"):
+        log_action(db, "API", "ALERTS_SEEDED", "synthetic_alerts.json", result)
+        db.commit()
     return result

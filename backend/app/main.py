@@ -1,3 +1,4 @@
+import logging
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -37,14 +38,18 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+logger = logging.getLogger("socmind")
+
+
 # Global Error Handler
 @app.exception_handler(Exception)
 async def global_exception_handler(request: Request, exc: Exception):
+    logger.exception("Unhandled error on %s", request.url.path)  # details stay in the server log
     return JSONResponse(
         status_code=500,
         content={
             "error": "Internal Server Error",
-            "message": str(exc),
+            "message": "An unexpected error occurred. See server logs for details.",
             "path": request.url.path
         }
     )
