@@ -1,6 +1,7 @@
 import os
 import json
 from typing import Dict, Any, List
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 from app.models.models import AlertModel
 from app.services.normalization import NormalizationService
@@ -60,7 +61,13 @@ def seed_synthetic_alerts(db: Session) -> Dict[str, Any]:
         db.add(alert_record)
         inserted_count += 1
 
-    db.commit()
+    try:
+        db.commit()
+    except IntegrityError:
+        # Another request seeded the same alerts at the same moment (e.g. a double-submitted call).
+        db.rollback()
+        return {"status": "success", "inserted": 0, "skipped": len(raw_alerts),
+                "total_processed": len(raw_alerts), "note": "alerts were seeded concurrently"}
 
     return {
         "status": "success",

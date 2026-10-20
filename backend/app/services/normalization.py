@@ -9,6 +9,7 @@ SEVERITY_MAP = {
     "catastrophic": "CRITICAL",
     "1": "CRITICAL",
     "10": "CRITICAL",
+    "9": "CRITICAL",
     "high": "HIGH",
     "severe": "HIGH",
     "2": "HIGH",
@@ -18,6 +19,7 @@ SEVERITY_MAP = {
     "moderate": "MEDIUM",
     "3": "MEDIUM",
     "5": "MEDIUM",
+    "6": "MEDIUM",
     "low": "LOW",
     "minor": "LOW",
     "4": "LOW",
@@ -67,9 +69,11 @@ class NormalizationService:
             return "CrowdStrike EDR"
         elif "splunk" in src_lower:
             return "Splunk SIEM"
+        elif "microsoft sentinel" in src_lower or "azure sentinel" in src_lower:
+            return "Microsoft Sentinel"
         elif "defender" in src_lower or "microsoft" in src_lower:
             return "Microsoft Defender"
-        elif "palo" in src_lower or "pan" in src_lower or "firewall" in src_lower:
+        elif "palo" in src_lower or re.search(r"\bpan(-?os)?\b", src_lower) or "firewall" in src_lower:
             return "Palo Alto Firewall"
         elif "sentinel" in src_lower:
             return "SentinelOne"
