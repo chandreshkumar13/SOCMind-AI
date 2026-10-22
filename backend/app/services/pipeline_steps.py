@@ -41,6 +41,7 @@ def alert_dict(alert: AlertModel) -> Dict[str, Any]:
         "file_hash": alert.file_hash,
         "command_line": alert.command_line,
         "status": alert.status,
+        "normalized_data": alert.normalized_data or {},
     }
 
 

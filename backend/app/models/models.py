@@ -37,6 +37,8 @@ class IncidentModel(Base):
     ai_summary = Column(Text, nullable=True)
     recommended_action = Column(String, nullable=True)
     human_approval_status = Column(String, default="PENDING")  # PENDING, APPROVED, REJECTED
+    # Structured analysis: correlation evidence, investigation timeline/findings, recommendations, review decision
+    details = Column(JSON, nullable=True)
 
 
 class AuditLogModel(Base):

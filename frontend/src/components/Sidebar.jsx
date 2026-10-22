@@ -9,12 +9,12 @@ import {
   ShieldCheck
 } from 'lucide-react';
 
-export default function Sidebar({ activeTab, setActiveTab }) {
+export default function Sidebar({ activeTab, setActiveTab, counts = {} }) {
   const navItems = [
     { id: 'dashboard', label: 'Dashboard', icon: LayoutDashboard },
-    { id: 'alerts', label: 'Security Alerts', icon: AlertTriangle, badge: '5' },
-    { id: 'incidents', label: 'Correlated Incidents', icon: FolderGit2 },
-    { id: 'agents', label: 'Agent Pipeline', icon: Cpu, badge: '5 Active' },
+    { id: 'alerts', label: 'Security Alerts', icon: AlertTriangle, badge: counts.alerts ? String(counts.alerts) : null },
+    { id: 'incidents', label: 'Correlated Incidents', icon: FolderGit2, badge: counts.incidents ? String(counts.incidents) : null },
+    { id: 'agents', label: 'Agent Pipeline', icon: Cpu },
     { id: 'settings', label: 'Settings & Config', icon: Settings },
   ];
 

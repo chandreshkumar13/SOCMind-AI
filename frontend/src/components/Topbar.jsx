@@ -1,7 +1,9 @@
 import React from 'react';
 import { Activity, Bell, User, Cpu } from 'lucide-react';
 
-export default function Topbar({ activeTab }) {
+export default function Topbar({ activeTab, online }) {
+  const status = online === null ? 'Checking...' : online ? 'Online' : 'Unreachable';
+  const color = online === false ? '#f87171' : 'var(--accent-cyan)';
   const titles = {
     dashboard: 'SOC Overview & Metrics',
     alerts: 'Normalized Security Alerts Queue',
@@ -40,10 +42,10 @@ export default function Topbar({ activeTab }) {
           background: 'rgba(0, 242, 254, 0.08)',
           border: '1px solid rgba(0, 242, 254, 0.2)',
           fontSize: '12px',
-          color: 'var(--accent-cyan)'
+          color
         }}>
-          <Activity size={14} className="pulse" />
-          <span>Backend API: Online (Port 8000)</span>
+          <Activity size={14} className={online ? 'pulse' : ''} />
+          <span>Backend API: {status}</span>
         </div>
 
         {/* User Profile */}

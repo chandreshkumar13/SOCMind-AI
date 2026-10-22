@@ -1,8 +1,73 @@
 import React, { useState } from 'react';
 import { Filter, Search, PlusCircle, RefreshCw, AlertTriangle } from 'lucide-react';
 import StatusBadge from '../components/StatusBadge';
+import { api } from '../api';
+import { reputationKey } from '../lib/view';
 
-export default function Alerts({ alerts, loading, error, refreshAlerts }) {
+// Triage and enrichment results stored on the alert (normalized_data.triage / .enrichment)
+export function AnalysisPanels({ alert, busy, onRun, runError }) {
+  const data = alert.normalized_data || {};
+  const triage = data.triage;
+  const enr = data.enrichment;
+  const closed = alert.status === 'CLOSED';
+  const small = { fontSize: '11px', color: 'var(--text-muted)' };
+  const btn = { padding: '4px 10px', borderRadius: 'var(--radius-sm)', border: '1px solid var(--border-color)', background: 'rgba(255,255,255,0.05)', color: 'var(--accent-cyan)', fontSize: '12px', cursor: busy ? 'wait' : 'pointer' };
+  return (
+    <div style={{ marginTop: '12px', paddingTop: '12px', borderTop: '1px solid var(--border-color)', display: 'flex', flexDirection: 'column', gap: '12px' }}>
+      <div style={{ display: 'flex', gap: '8px', alignItems: 'center', flexWrap: 'wrap' }}>
+        <button style={btn} disabled={busy} onClick={() => onRun('triage')}>{triage ? 'Re-run triage' : 'Run triage'}</button>
+        <button style={btn} disabled={busy} onClick={() => onRun('enrich')}>{enr ? 'Re-run enrichment' : 'Run enrichment'}</button>
+        {closed && <span style={small}>Closed alerts keep their CLOSED status.</span>}
+      </div>
+      {runError && <div style={{ fontSize: '12px', color: '#f87171' }}>{runError}</div>}
+
+      <div>
+        <strong style={{ color: 'var(--accent-cyan)' }}>Triage</strong>
+        {!triage && <div style={small}>Not triaged yet.</div>}
+        {triage && (
+          <div style={{ fontSize: '12px', marginTop: '4px' }}>
+            Score <strong>{triage.suspicion_score}/100</strong> · priority <StatusBadge severity={triage.priority} />
+            <ul style={{ margin: '6px 0 0 16px' }}>
+              {(triage.indicators || []).map((i, k) => <li key={k}>{i}</li>)}
+              {(triage.indicators || []).length === 0 && <li style={small}>No additional risk indicators.</li>}
+            </ul>
+          </div>
+        )}
+      </div>
+
+      <div>
+        <strong style={{ color: 'var(--accent-cyan)' }}>IOC enrichment</strong>
+        {!enr && <div style={small}>Not enriched yet.</div>}
+        {enr && (
+          <div style={{ fontSize: '12px', marginTop: '4px' }}>
+            {enr.total_iocs_extracted} IOC(s): {enr.summary.malicious} malicious · {enr.summary.suspicious} suspicious · {enr.summary.clean} clean · {enr.summary.unknown} unknown
+            {enr.disclaimer && <div style={{ ...small, color: '#fde047', marginTop: '4px' }}>{enr.disclaimer}</div>}
+            {enr.iocs.length > 0 && (
+              <table className="cyber-table" style={{ marginTop: '6px' }}>
+                <thead><tr><th>Type</th><th>Value</th><th>Reputation (mock)</th><th>Evidence</th></tr></thead>
+                <tbody>
+                  {enr.iocs.map((i, k) => (
+                    <tr key={k}>
+                      <td className="code-font">{i.type}</td>
+                      <td className="code-font" style={{ wordBreak: 'break-all', fontSize: '10px' }}>{i.value}</td>
+                      <td><StatusBadge severity={reputationKey(i.reputation)} label={i.reputation} /></td>
+                      <td style={small}>{i.evidence}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            )}
+          </div>
+        )}
+      </div>
+      {data.incident_id && <div style={small}>Part of incident <strong className="code-font">{data.incident_id}</strong> (see Correlated Incidents).</div>}
+    </div>
+  );
+}
+
+export default function Alerts({ alerts, loading, error, refreshAlerts, seedSampleAlerts }) {
+  const [analysisBusy, setAnalysisBusy] = useState(false);
+  const [analysisError, setAnalysisError] = useState(null);
   const [filterSeverity, setFilterSeverity] = useState('ALL');
   const [searchQuery, setSearchQuery] = useState('');
   const [selectedAlert, setSelectedAlert] = useState(null);
@@ -27,10 +92,7 @@ export default function Alerts({ alerts, loading, error, refreshAlerts }) {
   const handleInspectAlert = async (alertId) => {
     setFetchingDetail(true);
     try {
-      const res = await fetch(`http://localhost:8000/api/v1/alerts/${alertId}`);
-      if (!res.ok) throw new Error('Failed to fetch alert details');
-      const data = await res.json();
-      setSelectedAlert(data);
+      setSelectedAlert(await api(`/alerts/${alertId}`));
     } catch (err) {
       console.error(err);
       const fallback = alerts.find(a => a.id === alertId);
@@ -56,17 +118,27 @@ export default function Alerts({ alerts, loading, error, refreshAlerts }) {
     };
 
     try {
-      const res = await fetch('http://localhost:8000/api/v1/alerts', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(syntheticPayload)
-      });
-      if (!res.ok) throw new Error('Failed to ingest test alert');
+      await api('/alerts', { method: 'POST', body: syntheticPayload });
       await refreshAlerts();
     } catch (err) {
       alert(`Error ingesting test alert: ${err.message}`);
     } finally {
       setIngesting(false);
+    }
+  };
+
+  // Run triage or enrichment on the selected alert; the response carries the updated alert
+  const handleRunAnalysis = async (kind) => {
+    setAnalysisBusy(true);
+    setAnalysisError(null);
+    try {
+      const res = await api(`/alerts/${selectedAlert.id}/${kind}`, { method: 'POST' });
+      setSelectedAlert(res.alert);
+      await refreshAlerts();
+    } catch (err) {
+      setAnalysisError(err.message);
+    } finally {
+      setAnalysisBusy(false);
     }
   };
 
@@ -210,7 +282,16 @@ export default function Alerts({ alerts, loading, error, refreshAlerts }) {
                 {filteredAlerts.length === 0 ? (
                   <tr>
                     <td colSpan="8" style={{ textAlign: 'center', padding: '32px', color: 'var(--text-muted)' }}>
-                      No security alerts found matching the active search/severity filter.
+                      {alerts.length === 0 ? (
+                        <>
+                          No alerts have been ingested yet.{' '}
+                          {seedSampleAlerts && (
+                            <button onClick={seedSampleAlerts} style={{ marginLeft: '8px', padding: '4px 10px', borderRadius: 'var(--radius-sm)', border: '1px solid var(--border-color)', background: 'rgba(255,255,255,0.05)', color: 'var(--accent-cyan)', fontSize: '12px', cursor: 'pointer' }}>
+                              Load sample (synthetic) alerts
+                            </button>
+                          )}
+                        </>
+                      ) : 'No security alerts found matching the active search/severity filter.'}
                     </td>
                   </tr>
                 ) : (
@@ -340,6 +421,8 @@ export default function Alerts({ alerts, loading, error, refreshAlerts }) {
                       Status: <strong>{selectedAlert.status || 'NEW'}</strong> | Ext ID: <code>{selectedAlert.external_alert_id || selectedAlert.id}</code>
                     </div>
                   </div>
+
+                  <AnalysisPanels alert={selectedAlert} busy={analysisBusy} onRun={handleRunAnalysis} runError={analysisError} />
                 </div>
               )}
             </div>

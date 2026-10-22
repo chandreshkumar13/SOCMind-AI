@@ -112,14 +112,19 @@ def test_internal_errors_are_not_exposed_to_clients(iso_client, monkeypatch):
 
 
 def test_no_duplicate_routes_and_phase3_routes_registered():
-    from app.api.v1 import alerts_api, audit_api, health
+    from app.api.v1 import alerts_api, audit_api, health, incidents_api, pipeline_api
 
-    leaf = Counter((m, r.path) for router in (health.router, alerts_api.router, audit_api.router)
+    leaf = Counter((m, r.path) for router in (health.router, alerts_api.router, audit_api.router,
+                                              incidents_api.router, pipeline_api.router)
                    for r in router.routes for m in r.methods)
     assert [k for k, n in leaf.items() if n > 1] == []
     paths = app.openapi()["paths"]
     for method, path in [("post", "/api/v1/alerts/{alert_id}/triage"), ("post", "/api/v1/alerts/{alert_id}/enrich"),
                          ("get", "/api/v1/audit-logs"), ("post", "/api/v1/alerts/seed")]:
         assert method in paths[path]
-    # Phase 4+ endpoints must not be registered yet
-    assert not any(p.startswith(("/api/v1/incidents", "/api/v1/pipeline")) for p in paths)
+    # Phase 4 endpoints are registered too
+    for method, path in [("post", "/api/v1/incidents/correlate"), ("get", "/api/v1/incidents"),
+                         ("post", "/api/v1/incidents/{incident_id}/investigate"), ("post", "/api/v1/incidents/{incident_id}/recommend"),
+                         ("post", "/api/v1/incidents/{incident_id}/approve"), ("post", "/api/v1/incidents/{incident_id}/reject"),
+                         ("post", "/api/v1/pipeline/run"), ("get", "/api/v1/pipeline/runs"), ("get", "/api/v1/agents")]:
+        assert method in paths[path]

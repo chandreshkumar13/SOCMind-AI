@@ -1,8 +1,17 @@
 import React from 'react';
-import { AlertTriangle, ShieldCheck, Zap, Cpu, Activity, Clock } from 'lucide-react';
+import { AlertTriangle, Zap, Cpu, UserCheck } from 'lucide-react';
 import StatusBadge from '../components/StatusBadge';
+import { ErrorCard } from '../components/StateCards';
+import { api } from '../api';
+import useAsync from '../lib/useAsync';
 
-export default function Dashboard({ alerts, setActiveTab }) {
+export default function Dashboard({ alerts, incidents, setActiveTab }) {
+  const agents = useAsync(() => api('/agents'), []);
+  const open = (incidents || []).filter((i) => i.status !== 'MERGED');
+  const awaiting = open.filter((i) => i.status === 'RESPONSE_PROPOSED' && i.human_approval_status === 'PENDING').length;
+  const agentList = agents.data || [];
+  const healthy = agentList.filter((a) => a.status === 'READY' && a.failures === 0).length;
+
   return (
     <div>
       {/* Top Welcome Banner */}
@@ -23,7 +32,7 @@ export default function Dashboard({ alerts, setActiveTab }) {
           </div>
           <div>
             <div className="metric-value">{alerts.length}</div>
-            <div className="metric-label">Active Synthetic Alerts</div>
+            <div className="metric-label">Alerts In Queue</div>
           </div>
         </div>
 
@@ -32,7 +41,7 @@ export default function Dashboard({ alerts, setActiveTab }) {
             <Zap size={24} />
           </div>
           <div>
-            <div className="metric-value">2</div>
+            <div className="metric-value">{open.length}</div>
             <div className="metric-label">Correlated Incidents</div>
           </div>
         </div>
@@ -42,18 +51,18 @@ export default function Dashboard({ alerts, setActiveTab }) {
             <Cpu size={24} />
           </div>
           <div>
-            <div className="metric-value">5 / 5</div>
-            <div className="metric-label">AI Agents Ready</div>
+            <div className="metric-value">{agents.data ? `${healthy} / ${agentList.length}` : '–'}</div>
+            <div className="metric-label">Agents Ready (no failures)</div>
           </div>
         </div>
 
         <div className="glass-card metric-card">
           <div className="metric-icon" style={{ background: 'rgba(16, 185, 129, 0.1)', color: '#10b981' }}>
-            <Clock size={24} />
+            <UserCheck size={24} />
           </div>
           <div>
-            <div className="metric-value">-78%</div>
-            <div className="metric-label">Estimated MTTR Reduction</div>
+            <div className="metric-value">{awaiting}</div>
+            <div className="metric-label">Awaiting Human Review</div>
           </div>
         </div>
       </div>
@@ -84,13 +93,16 @@ export default function Dashboard({ alerts, setActiveTab }) {
                 </tr>
               </thead>
               <tbody>
+                {alerts.length === 0 && (
+                  <tr><td colSpan="5" style={{ textAlign: 'center', padding: '24px', color: 'var(--text-muted)' }}>No alerts ingested yet.</td></tr>
+                )}
                 {alerts.slice(0, 4).map((a) => (
                   <tr key={a.id}>
                     <td className="code-font">{a.id}</td>
-                    <td style={{ fontWeight: 600 }}>{a.alert_name}</td>
-                    <td style={{ color: 'var(--text-muted)' }}>{a.source_system}</td>
-                    <td><StatusBadge severity={a.raw_severity} /></td>
-                    <td className="code-font">{a.host_name || a.ip_address}</td>
+                    <td style={{ fontWeight: 600 }}>{a.alert_title}</td>
+                    <td style={{ color: 'var(--text-muted)' }}>{a.source}</td>
+                    <td><StatusBadge severity={a.severity} /></td>
+                    <td className="code-font">{a.host || a.source_ip || 'N/A'}</td>
                   </tr>
                 ))}
               </tbody>
@@ -101,15 +113,11 @@ export default function Dashboard({ alerts, setActiveTab }) {
         {/* AI Agent Status Panel */}
         <div className="glass-card">
           <h3 style={{ fontSize: '16px', marginBottom: '16px' }}>Agent Pipeline Status</h3>
+          {agents.error && <ErrorCard title="Agent status unavailable" message={agents.error} onRetry={agents.reload} />}
+          {agents.loading && !agents.data && <div style={{ fontSize: '12px', color: 'var(--accent-cyan)' }}>Loading agent activity...</div>}
           <div style={{ display: 'flex', flexDirection: 'column', gap: '12px' }}>
-            {[
-              { name: '1. Triage Agent', desc: 'Normalized alert severity analysis' },
-              { name: '2. Correlation Agent', desc: 'Grouping duplicate/related alerts' },
-              { name: '3. Enrichment Agent', desc: 'IOC reputation & threat intel queries' },
-              { name: '4. Investigation Agent', desc: 'Forensic log timeline reconstruction' },
-              { name: '5. Response Agent', desc: 'Human-in-the-loop action proposals' }
-            ].map((agent, i) => (
-              <div key={i} style={{
+            {agentList.map((agent) => (
+              <div key={agent.name} style={{
                 padding: '10px 14px',
                 borderRadius: 'var(--radius-sm)',
                 background: 'rgba(255, 255, 255, 0.02)',
@@ -120,11 +128,11 @@ export default function Dashboard({ alerts, setActiveTab }) {
               }}>
                 <div>
                   <div style={{ fontSize: '13px', fontWeight: 600 }}>{agent.name}</div>
-                  <div style={{ fontSize: '11px', color: 'var(--text-muted)' }}>{agent.desc}</div>
+                  <div style={{ fontSize: '11px', color: 'var(--text-muted)' }}>{agent.total_actions} action(s) logged{agent.last_action ? ` · last: ${agent.last_action}` : ''}</div>
                 </div>
                 <div className="agent-status-active">
                   <div className="status-dot"></div>
-                  <span>Ready</span>
+                  <span>{agent.failures > 0 ? `${agent.failures} failed` : 'Ready'}</span>
                 </div>
               </div>
             ))}
