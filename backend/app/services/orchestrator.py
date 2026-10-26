@@ -33,6 +33,7 @@ from app.services.pipeline_steps import enrich_alert_record, triage_alert_record
 
 _RUN_LOCK = threading.Lock()
 MAX_ERROR_LENGTH = 300
+MAX_ITEMS = 50   # ids listed per stage in the run report; `processed` always holds the true count
 
 
 class PipelineBusy(Exception):
@@ -141,12 +142,13 @@ class PipelineOrchestrator:
         t = time.perf_counter()
         try:
             result = fn()
-            stage = {"agent": name, "status": "success", "processed": len(result.get("created", [])) + len(result.get("updated", [])) if isinstance(result, dict) else 0,
+            items = (result.get("created", []) + result.get("updated", [])) if isinstance(result, dict) else []
+            stage = {"agent": name, "status": "success", "processed": len(items), "items": items[:MAX_ITEMS],
                      "skipped": 0, "duration_ms": int((time.perf_counter() - t) * 1000), "errors": [], "notes": []}
             return {"stage": stage, "result": result}
         except Exception as exc:  # noqa: BLE001 - a failing agent must not stop the pipeline
             db.rollback()
-            stage = {"agent": name, "status": "failed", "processed": 0, "skipped": 0,
+            stage = {"agent": name, "status": "failed", "processed": 0, "items": [], "skipped": 0,
                      "duration_ms": int((time.perf_counter() - t) * 1000), "errors": [_error_text(exc)], "notes": []}
             log_action(db, name, "AGENT_FAILED", None, {"error": stage["errors"][0]})
             db.commit()
@@ -154,7 +156,7 @@ class PipelineOrchestrator:
 
     def _per_item_stage(self, db: Session, name: str, ids: List[str], needs_work, fn, model=AlertModel) -> Dict[str, Any]:
         t = time.perf_counter()
-        done, errors, notes, skipped = 0, [], [], 0
+        done, errors, notes, skipped, items = 0, [], [], 0, []
         for item_id in ids:
             try:
                 item = db.query(model).filter(model.id == item_id).first()
@@ -166,6 +168,7 @@ class PipelineOrchestrator:
                 fn(item) if model is IncidentModel else fn(db, item)
                 db.commit()
                 done += 1
+                items.append(item_id)
             except DecisionError as exc:
                 db.rollback()
                 skipped += 1
@@ -176,5 +179,5 @@ class PipelineOrchestrator:
                 log_action(db, name, "AGENT_FAILED", item_id, {"error": _error_text(exc)})
                 db.commit()
         status = "success" if not errors else ("failed" if done == 0 and ids else "partial")
-        return {"agent": name, "status": status, "processed": done, "skipped": skipped,
+        return {"agent": name, "status": status, "processed": done, "items": items[:MAX_ITEMS], "skipped": skipped,
                 "duration_ms": int((time.perf_counter() - t) * 1000), "errors": errors, "notes": notes}

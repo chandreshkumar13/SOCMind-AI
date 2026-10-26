@@ -1,9 +1,30 @@
-"""Shared pytest fixtures.
+"""Shared pytest fixtures and test-database isolation.
 
-`iso_client` gives each test its own temporary SQLite database, so new tests never read from or
-modify the real socmind.db file. (The older tests in test_alerts.py use the shared database.)
+The whole test session runs against a throw-away SQLite file in the system temp directory. DATABASE_URL is
+forced here, BEFORE the application is imported, so neither a developer's socmind.db nor a DATABASE_URL set in the
+shell or in a .env file can ever be read or modified by the tests. (Environment variables take precedence over .env.)
+
+`iso_client` additionally gives each test its own temporary database for tests that need a clean slate; the older
+modules (test_alerts.py, test_enrichment.py) share the session database.
 """
-import pytest
+import atexit
+import os
+import shutil
+import tempfile
+
+_SESSION_DB_DIR = tempfile.mkdtemp(prefix="socmind-tests-")
+os.environ["DATABASE_URL"] = "sqlite:///" + os.path.join(_SESSION_DB_DIR, "session.db").replace("\\", "/")
+atexit.register(shutil.rmtree, _SESSION_DB_DIR, ignore_errors=True)
+
+
+def pytest_sessionfinish(session, exitstatus):
+    """Release the SQLite file (Windows cannot delete an open file) and remove the throw-away directory."""
+    from app.db.session import engine
+    engine.dispose()
+    shutil.rmtree(_SESSION_DB_DIR, ignore_errors=True)
+
+
+import pytest  # noqa: E402  (must come after DATABASE_URL is set)
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker

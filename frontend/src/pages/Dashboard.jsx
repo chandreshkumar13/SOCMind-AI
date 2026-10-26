@@ -5,10 +5,15 @@ import { ErrorCard } from '../components/StateCards';
 import { api } from '../api';
 import useAsync from '../lib/useAsync';
 
-export default function Dashboard({ alerts, incidents, setActiveTab }) {
+export default function Dashboard({ alerts, incidents, stats, setActiveTab }) {
   const agents = useAsync(() => api('/agents'), []);
   const open = (incidents || []).filter((i) => i.status !== 'MERGED');
-  const awaiting = open.filter((i) => i.status === 'RESPONSE_PROPOSED' && i.human_approval_status === 'PENDING').length;
+  // /stats counts in the database; the lists are capped, so they are only a fallback while stats load
+  const alertTotal = stats ? stats.alerts.total : alerts.length;
+  const incidentTotal = stats ? stats.incidents.total : open.length;
+  const awaiting = stats
+    ? stats.incidents.awaiting_human_review
+    : open.filter((i) => i.status === 'RESPONSE_PROPOSED' && i.human_approval_status === 'PENDING').length;
   const agentList = agents.data || [];
   const healthy = agentList.filter((a) => a.status === 'READY' && a.failures === 0).length;
 
@@ -31,7 +36,7 @@ export default function Dashboard({ alerts, incidents, setActiveTab }) {
             <AlertTriangle size={24} />
           </div>
           <div>
-            <div className="metric-value">{alerts.length}</div>
+            <div className="metric-value">{alertTotal}</div>
             <div className="metric-label">Alerts In Queue</div>
           </div>
         </div>
@@ -41,7 +46,7 @@ export default function Dashboard({ alerts, incidents, setActiveTab }) {
             <Zap size={24} />
           </div>
           <div>
-            <div className="metric-value">{open.length}</div>
+            <div className="metric-value">{incidentTotal}</div>
             <div className="metric-label">Correlated Incidents</div>
           </div>
         </div>

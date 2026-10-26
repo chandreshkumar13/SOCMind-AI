@@ -9,7 +9,8 @@ export default function Topbar({ activeTab, online }) {
     alerts: 'Normalized Security Alerts Queue',
     incidents: 'Correlated Incident Candidates & Timelines',
     agents: 'Multi-Agent Autonomous Pipeline Status',
-    settings: 'System Configuration & LLM Provider'
+    audit: 'Audit Trail of Agent and Analyst Actions',
+    settings: 'Backend Configuration & Safety Boundaries'
   };
 
   return (

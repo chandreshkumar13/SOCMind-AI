@@ -16,6 +16,10 @@ CORRELATE_FROM = ("NEW", "TRIAGED", "ENRICHED")
 INVESTIGATE_FROM = ("NEW", "TRIAGED", "ENRICHED", "CORRELATED")
 
 
+def _now_iso() -> str:
+    return datetime.utcnow().isoformat() + "Z"
+
+
 def _details(incident: IncidentModel) -> Dict[str, Any]:
     """Deep copy of incident.details, so nested edits are always detected as a change when saved."""
     return copy.deepcopy(incident.details or {})
@@ -103,6 +107,11 @@ def _correlate_once(db: Session, window_hours: int) -> Dict[str, Any]:
             target.title = _incident_title(group)
             target_details = _details(target)
             target_details.update({"correlation": correlation_info, "investigation_stale": True, "recommendations_stale": True})
+            if target.human_approval_status != "PENDING":
+                # The old decision no longer applies; keep it as history rather than showing it as current
+                target_details.setdefault("review_history", []).append(
+                    {"review": target_details.pop("review", None), "simulation": target_details.pop("simulation", None),
+                     "superseded_at": _now_iso()})
             target.details = target_details
             if target.human_approval_status != "PENDING":
                 log_action(db, agent.agent_name, "APPROVAL_RESET", target.id,
@@ -132,14 +141,17 @@ def _correlate_once(db: Session, window_hours: int) -> Dict[str, Any]:
 def investigate_incident(db: Session, incident: IncidentModel) -> Dict[str, Any]:
     """Runs the Investigation Agent on an incident and stores timeline/findings in incident.details."""
     from app.agents.investigation.investigation_agent import InvestigationAgent
-    from app.services.log_store import load_sample_logs
+    from app.services.log_store import LOG_SOURCE_PATH, load_sample_logs
 
     alerts = db.query(AlertModel).filter(AlertModel.id.in_(incident.correlated_alert_ids or [])).all()
     agent = InvestigationAgent()
     details = _details(incident)
+    logs = load_sample_logs()
     result = agent.investigate({"id": incident.id, "title": incident.title, "severity": incident.severity,
                                 "correlation": details.get("correlation")},
-                               [alert_dict(a) for a in alerts], load_sample_logs())
+                               [alert_dict(a) for a in alerts], logs)
+    result["log_source"] = {"type": "synthetic_sample_file", "path": LOG_SOURCE_PATH, "records_available": len(logs),
+                            "note": "Logs come from a bundled synthetic sample file; no SIEM or log platform was queried."}
     details["investigation"] = result
     details["investigation_stale"] = False
     details["recommendations_stale"] = True
@@ -196,15 +208,60 @@ def review_incident(db: Session, incident: IncidentModel, decision: str, reviewe
         raise DecisionError("The recommendation is out of date because the incident changed; regenerate it first.")
     if incident.human_approval_status != "PENDING":
         raise DecisionError(f"A decision ({incident.human_approval_status}) is already recorded for this incident.")
+    # Claim the decision atomically: if a concurrent request decided first, this UPDATE matches no row
+    claimed = (db.query(IncidentModel)
+               .filter(IncidentModel.id == incident.id, IncidentModel.human_approval_status == "PENDING")
+               .update({"human_approval_status": decision}, synchronize_session=False))
+    if claimed != 1:
+        db.rollback()
+        raise DecisionError("A decision was recorded by someone else at the same moment; reload the incident.")
     for r in recs:
         r["status"] = decision
     details["recommendations"] = recs
     details["review"] = {"decision": decision, "reviewer": reviewer, "reason": reason,
-                         "reviewed_at": datetime.utcnow().isoformat(),
+                         "reviewed_at": _now_iso(),
                          "execution": "simulation_only: no action was executed by SOCMind AI"}
     incident.details = details
     incident.human_approval_status = decision
     incident.status = f"RESPONSE_{decision}"
     log_action(db, reviewer, f"INCIDENT_{decision}", incident.id, {"reason": reason, "recommendations": [r["action"] for r in recs]})
+    db.commit()
+    return incident
+
+
+def simulate_response(db: Session, incident: IncidentModel, actor: str, reason: str = None) -> IncidentModel:
+    """Records a SIMULATION of an approved response. Nothing is executed and no system is touched.
+
+    APPROVED means "a human agreed to the proposal"; SIMULATED means "the workflow was rehearsed". There is no
+    state meaning EXECUTED because SOCMind AI has no real response integration.
+    """
+    details = _details(incident)
+    recs = details.get("recommendations") or []
+    if incident.human_approval_status != "APPROVED":
+        raise DecisionError(f"Only an approved response can be simulated (current decision: {incident.human_approval_status}).")
+    if details.get("recommendations_stale") or not recs:
+        raise DecisionError("The approved recommendations are out of date; regenerate and re-approve them first.")
+    if details.get("simulation") or incident.status == "RESPONSE_SIMULATED":
+        raise DecisionError("This approved response was already simulated.")
+    claimed = (db.query(IncidentModel)
+               .filter(IncidentModel.id == incident.id, IncidentModel.status == "RESPONSE_APPROVED")
+               .update({"status": "RESPONSE_SIMULATED"}, synchronize_session=False))
+    if claimed != 1:
+        db.rollback()
+        raise DecisionError("The incident changed at the same moment; reload it and try again.")
+    for r in recs:
+        r["simulation_status"] = "SIMULATED"
+        r["executed"] = False
+    details["recommendations"] = recs
+    details["simulation"] = {
+        "mode": "simulation", "status": "SIMULATED", "simulated_by": actor, "reason": reason, "simulated_at": _now_iso(),
+        "actions": [{"id": r["id"], "action": r["action"], "outcome": "Simulated only. No command was run and no system was changed."}
+                    for r in recs],
+        "note": "SOCMind AI has no real response integration. Carry out approved actions manually through your own change process.",
+    }
+    incident.details = details
+    incident.status = "RESPONSE_SIMULATED"
+    log_action(db, actor, "RESPONSE_SIMULATED", incident.id,
+               {"reason": reason, "actions": [r["action"] for r in recs], "executed": False})
     db.commit()
     return incident

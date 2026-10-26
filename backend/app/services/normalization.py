@@ -97,11 +97,14 @@ class NormalizationService:
             parsed_ts = raw_ts
         elif isinstance(raw_ts, str):
             try:
-                parsed_ts = datetime.fromisoformat(raw_ts.replace("Z", "+00:00"))
+                parsed_ts = datetime.fromisoformat(raw_ts.strip().replace("Z", "+00:00"))
             except ValueError:
                 parsed_ts = datetime.utcnow()
         else:
             parsed_ts = datetime.utcnow()
+        # Everything is stored as naive UTC. Convert aware values; do not just drop their offset.
+        if parsed_ts.tzinfo is not None:
+            parsed_ts = parsed_ts.astimezone(timezone.utc).replace(tzinfo=None)
 
         # Source normalization
         source = cls.normalize_source(payload.get("source") or payload.get("source_system"))

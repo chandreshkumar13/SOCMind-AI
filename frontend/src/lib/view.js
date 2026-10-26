@@ -81,3 +81,39 @@ export function runBadgeKey(outcome) {
 export function stageBadgeKey(status) {
   return { success: 'success', partial: 'high', failed: 'critical' }[status] || 'low';
 }
+
+/** Simulation is only possible for a fresh APPROVED decision, and only once. Nothing is ever executed. */
+export function simulationState(incident) {
+  const details = (incident && incident.details) || {};
+  if (details.simulation) return { canSimulate: false, simulated: true, reason: 'This approved response was already simulated.' };
+  if (!incident || incident.human_approval_status !== 'APPROVED') {
+    return { canSimulate: false, simulated: false, reason: 'Only an approved response can be simulated.' };
+  }
+  if (details.recommendations_stale) {
+    return { canSimulate: false, simulated: false, reason: 'The approved recommendations are out of date. Regenerate and re-approve them.' };
+  }
+  return { canSimulate: true, simulated: false, reason: '' };
+}
+
+/** Query string for GET /audit-logs; empty filters are left out and the action is upper-cased as the API expects. */
+export function auditQuery({ actor = '', action = '', target = '', limit = 50, offset = 0 } = {}) {
+  const params = new URLSearchParams();
+  if (actor.trim()) params.set('actor', actor.trim());
+  if (action.trim()) params.set('action', action.trim().toUpperCase());
+  if (target.trim()) params.set('target_id', target.trim());
+  params.set('limit', String(limit));
+  params.set('offset', String(offset));
+  return `?${params.toString()}`;
+}
+
+/** Compact one-line preview of an audit entry's details object. */
+export function previewDetails(details, max = 90) {
+  if (details === null || details === undefined || details === '') return '';
+  const text = typeof details === 'string' ? details : JSON.stringify(details);
+  return text.length > max ? `${text.slice(0, max - 1)}…` : text;
+}
+
+/** "Showing 100 of 130" style note when a list is shorter than the true total. */
+export function truncationNote(shown, total) {
+  return typeof total === 'number' && total > shown ? `Showing the first ${shown} of ${total}.` : '';
+}

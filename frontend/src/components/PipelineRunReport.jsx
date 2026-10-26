@@ -27,7 +27,7 @@ export default function PipelineRunReport({ run }) {
       <div className="table-container">
         <table className="cyber-table">
           <thead>
-            <tr><th>Stage</th><th>Status</th><th>Processed</th><th>Skipped</th><th>Time</th><th>Errors</th></tr>
+            <tr><th>Stage</th><th>Status</th><th>Processed</th><th>Handled</th><th>Skipped</th><th>Time</th><th>Errors</th></tr>
           </thead>
           <tbody>
             {(run.stages || []).map((s) => (
@@ -35,6 +35,9 @@ export default function PipelineRunReport({ run }) {
                 <td style={{ fontWeight: 600 }}>{s.agent}</td>
                 <td><StatusBadge severity={stageBadgeKey(s.status)} label={s.status} /></td>
                 <td className="code-font">{s.processed}</td>
+                <td className="code-font" style={{ fontSize: '11px', maxWidth: '220px', wordBreak: 'break-word' }}>
+                  {(s.items || []).length ? `${s.items.slice(0, 3).join(', ')}${s.processed > 3 ? ` +${s.processed - 3} more` : ''}` : '–'}
+                </td>
                 <td className="code-font">{s.skipped ?? 0}</td>
                 <td className="code-font">{s.duration_ms} ms</td>
                 <td style={{ fontSize: '12px', color: s.errors && s.errors.length ? '#f87171' : 'var(--text-muted)' }}>

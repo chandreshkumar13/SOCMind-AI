@@ -38,6 +38,8 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+logging.basicConfig(level=getattr(logging, str(settings.LOG_LEVEL).upper(), logging.INFO),
+                    format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 logger = logging.getLogger("socmind")
 
 

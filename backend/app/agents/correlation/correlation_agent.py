@@ -143,6 +143,6 @@ class CorrelationAgent:
             "shared_entities": shared,
             "reasons": reasons,
             "confidence": "high" if strong_hits >= 2 else "medium",
-            "first_seen": stamps[0].isoformat(),
-            "last_seen": stamps[-1].isoformat(),
+            "first_seen": stamps[0].isoformat() + "Z",
+            "last_seen": stamps[-1].isoformat() + "Z",
         }

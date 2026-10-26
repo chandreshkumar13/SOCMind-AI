@@ -8,6 +8,10 @@ LOG_PATH = os.path.abspath(
 )
 
 
+# Repository-relative path, shown to analysts so they know where investigation logs come from
+LOG_SOURCE_PATH = "data/sample_logs/sample_logs.json"
+
+
 def load_sample_logs(path: str = LOG_PATH) -> List[Dict[str, Any]]:
     """Returns the sample log records, or an empty list if the file is missing or invalid."""
     try:

@@ -1,9 +1,9 @@
-from datetime import datetime
 from typing import Any, Dict, List, Optional
 
 from pydantic import BaseModel, ConfigDict, Field
 
 from app.schemas.alert import AlertResponse
+from app.schemas.common import UTCDateTime
 
 
 class IncidentBase(BaseModel):
@@ -29,9 +29,9 @@ class IncidentResponse(IncidentBase):
 
 
 class IncidentOut(BaseModel):
-    """Incident as returned by the incidents API (real datetimes, structured details)."""
+    """Incident as returned by the incidents API (UTC timestamps, structured details)."""
     id: str
-    created_at: datetime
+    created_at: UTCDateTime
     title: str
     severity: str
     status: str

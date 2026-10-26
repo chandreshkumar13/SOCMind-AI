@@ -184,7 +184,7 @@ class ResponseAgent:
 
         recs.sort(key=lambda r: r["priority"])   # stable: equal priorities keep rule order
         for i, r in enumerate(recs, start=1):
-            r.update({"id": f"REC-{i}", "requires_approval": True, "status": "PENDING", "executed": False})
+            r.update({"id": f"REC-{i}", "requires_approval": True, "status": "PENDING", "executed": False, "simulation_status": "NOT_RUN"})
         scores = [(a.get("normalized_data") or {}).get("triage", {}).get("suspicion_score") for a in alerts]
         scores = [s for s in scores if isinstance(s, (int, float))]
         return {

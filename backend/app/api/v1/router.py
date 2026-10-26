@@ -1,5 +1,5 @@
 from fastapi import APIRouter
-from app.api.v1 import health, alerts_api, audit_api, incidents_api, pipeline_api
+from app.api.v1 import health, alerts_api, audit_api, incidents_api, pipeline_api, system_api
 
 api_router = APIRouter()
 
@@ -13,3 +13,5 @@ api_router.include_router(audit_api.router, tags=["Audit Log"])
 api_router.include_router(incidents_api.router, tags=["Incidents"])
 # Include pipeline routes (orchestration and agent status)
 api_router.include_router(pipeline_api.router, tags=["Pipeline & Agents"])
+# Include system routes (statistics and non-secret runtime configuration)
+api_router.include_router(system_api.router, tags=["System"])

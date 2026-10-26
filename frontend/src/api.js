@@ -1,7 +1,8 @@
 import { describeError } from './lib/view.js';
 
-// Same backend address the app already used; override with VITE_API_BASE if needed.
-export const API_BASE = import.meta.env.VITE_API_BASE || 'http://localhost:8000/api/v1';
+// Same backend address the app already used. Override with VITE_API_BASE (VITE_API_BASE_URL, used by
+// docker-compose.yml, is accepted too). Only a public URL belongs here: Vite bundles these values into the page.
+export const API_BASE = import.meta.env.VITE_API_BASE || import.meta.env.VITE_API_BASE_URL || 'http://localhost:8000/api/v1';
 
 export class ApiError extends Error {
   constructor(message, status) {

@@ -3,12 +3,14 @@
 Each step stores its result in alert.normalized_data, writes an audit entry and leaves the commit
 to the caller, so the change and its audit record are saved in one transaction.
 """
+from datetime import datetime, timezone
 from typing import Any, Dict
 
 from sqlalchemy.orm import Session
 
 from app.agents.enrichment.enrichment_agent import EnrichmentAgent
 from app.agents.triage.triage_agent import TriageAgent
+from app.core.config import settings
 from app.models.models import AlertModel
 from app.services.audit import log_action
 
@@ -21,6 +23,12 @@ INTEL_DISCLAIMER = (
     "Results come from LOCAL MOCK threat intelligence, not a verified live feed. "
     "A CLEAN or UNKNOWN reputation only means the mock has no malicious record; "
     "it does not mean the indicator is verified safe."
+)
+
+
+UNAVAILABLE_DISCLAIMER = (
+    "No threat-intelligence provider is available (THREAT_INTEL_MOCK_MODE is off and no live provider is implemented). "
+    "Indicators were extracted but NOT looked up, so UNKNOWN here means 'not checked', not 'safe'."
 )
 
 
@@ -65,10 +73,16 @@ def enrich_alert_record(db: Session, alert: AlertModel) -> Dict[str, Any]:
     only the additive provenance keys intel_mode / verified / disclaimer are attached here.
     """
     agent = EnrichmentAgent(mock_mode=True)
-    result = agent.enrich_alert(alert_dict(alert))
-    result["intel_mode"] = "mock"
+    mock_enabled = settings.THREAT_INTEL_MOCK_MODE
+    if mock_enabled:
+        result = agent.enrich_alert(alert_dict(alert))
+        result["intel_mode"] = "mock"
+        result["disclaimer"] = INTEL_DISCLAIMER
+    else:
+        result = _extraction_only_result(agent, alert_dict(alert))
+        result["intel_mode"] = "unavailable"
+        result["disclaimer"] = UNAVAILABLE_DISCLAIMER
     result["verified"] = False
-    result["disclaimer"] = INTEL_DISCLAIMER
     data = dict(alert.normalized_data or {})
     data["enrichment"] = result
     alert.normalized_data = data
@@ -76,5 +90,17 @@ def enrich_alert_record(db: Session, alert: AlertModel) -> Dict[str, Any]:
         alert.status = "ENRICHED"
     log_action(db, agent.agent_name, "ALERT_ENRICHED", alert.id,
                {"total_iocs_extracted": result["total_iocs_extracted"], "summary": result["summary"],
-                "intel_mode": "mock"})
+                "intel_mode": result["intel_mode"]})
     return result
+
+
+def _extraction_only_result(agent: EnrichmentAgent, alert: Dict[str, Any]) -> Dict[str, Any]:
+    """Same result shape as EnrichmentAgent.enrich_alert, but with no reputation lookup (no provider available)."""
+    iocs = [{"value": i["value"], "type": i["type"], "source": i["source"], "reputation": "UNKNOWN", "confidence": 0.0,
+             "evidence": "Not looked up: no threat-intelligence provider is available.", "provider": "none"}
+            for i in agent.extract_iocs(alert)]
+    return {
+        "agent": agent.agent_name, "status": "completed", "timestamp": datetime.now(timezone.utc).isoformat(),
+        "alert_id": str(alert.get("id") or "UNKNOWN"), "total_iocs_extracted": len(iocs),
+        "summary": {"malicious": 0, "suspicious": 0, "clean": 0, "unknown": len(iocs)}, "iocs": iocs, "lookup_performed": False,
+    }

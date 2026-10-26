@@ -2,6 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
   describeError, groupFindings, reputationKey, statusLabel, reviewState, formatUtc, summarizeRun, runBadgeKey, stageBadgeKey,
+  simulationState, auditQuery, previewDetails, truncationNote,
 } from './view.js';
 
 test('describeError uses string details, validation lists, then a generic message', () => {
@@ -57,4 +58,34 @@ test('run summaries and badge keys', () => {
   assert.equal(runBadgeKey('partial'), 'high');
   assert.equal(stageBadgeKey('success'), 'success');
   assert.equal(stageBadgeKey('failed'), 'critical');
+});
+
+
+test('simulationState: only a fresh approval, only once, and never "executed"', () => {
+  const inc = (status, details = {}) => ({ human_approval_status: status, details: { recommendations: [{}], ...details } });
+  assert.equal(simulationState(inc('APPROVED')).canSimulate, true);
+  assert.equal(simulationState(inc('PENDING')).canSimulate, false);
+  assert.equal(simulationState(inc('REJECTED')).canSimulate, false);
+  assert.match(simulationState(inc('APPROVED', { recommendations_stale: true })).reason, /out of date/);
+  const done = simulationState(inc('APPROVED', { simulation: { status: 'SIMULATED' } }));
+  assert.deepEqual([done.canSimulate, done.simulated], [false, true]);
+  assert.equal(simulationState(null).canSimulate, false);
+});
+
+test('auditQuery builds only the filters that are set', () => {
+  assert.equal(auditQuery(), '?limit=50&offset=0');
+  assert.equal(auditQuery({ action: ' incident_approved ', target: 'INC-2026-001', limit: 20, offset: 40 }), '?action=INCIDENT_APPROVED&target_id=INC-2026-001&limit=20&offset=40');
+  assert.equal(auditQuery({ actor: 'Triage Agent' }), '?actor=Triage+Agent&limit=50&offset=0');
+});
+
+test('previewDetails truncates and tolerates empty values', () => {
+  assert.equal(previewDetails(null), '');
+  assert.equal(previewDetails({ a: 1 }), '{"a":1}');
+  assert.equal(previewDetails('x'.repeat(200), 10), 'xxxxxxxxx…');
+});
+
+test('truncationNote only speaks when the list is shorter than the total', () => {
+  assert.equal(truncationNote(100, 130), 'Showing the first 100 of 130.');
+  assert.equal(truncationNote(10, 10), '');
+  assert.equal(truncationNote(10, undefined), '');
 });

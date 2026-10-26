@@ -5,6 +5,7 @@ import Dashboard from './pages/Dashboard';
 import Alerts from './pages/Alerts';
 import Incidents from './pages/Incidents';
 import AgentActivity from './pages/AgentActivity';
+import AuditLog from './pages/AuditLog';
 import Settings from './pages/Settings';
 import { api } from './api';
 
@@ -17,6 +18,7 @@ export default function App() {
   const [incidentsLoading, setIncidentsLoading] = useState(true);
   const [incidentsError, setIncidentsError] = useState(null);
   const [online, setOnline] = useState(null);
+  const [stats, setStats] = useState(null);
 
   const fetchAlerts = useCallback(async () => {
     setLoading(true);
@@ -45,6 +47,20 @@ export default function App() {
     }
   }, []);
 
+  const fetchStats = useCallback(async () => {
+    try {
+      setStats(await api('/stats'));
+    } catch {
+      setStats(null);   // pages fall back to the loaded lists
+    }
+  }, []);
+
+  const refreshAll = useCallback(() => {
+    fetchAlerts();
+    fetchIncidents();
+    fetchStats();
+  }, [fetchAlerts, fetchIncidents, fetchStats]);
+
   // Sample data is loaded only when the analyst asks for it, never silently on page load
   const seedSampleAlerts = useCallback(async () => {
     try {
@@ -53,27 +69,28 @@ export default function App() {
       setError(err.message);
     }
     await fetchAlerts();
-  }, [fetchAlerts]);
+    fetchStats();
+  }, [fetchAlerts, fetchStats]);
 
   useEffect(() => {
-    fetchAlerts();
-    fetchIncidents();
-  }, [fetchAlerts, fetchIncidents]);
+    refreshAll();
+  }, [refreshAll]);
 
   return (
     <div className="app-container">
-      <Sidebar activeTab={activeTab} setActiveTab={setActiveTab} counts={{ alerts: alerts.length, incidents: (incidents || []).filter((i) => i.status !== 'MERGED').length }} />
+      <Sidebar activeTab={activeTab} setActiveTab={setActiveTab} counts={{ audit: stats ? stats.audit_entries : 0, alerts: stats ? stats.alerts.total : alerts.length, incidents: stats ? stats.incidents.total : (incidents || []).filter((i) => i.status !== 'MERGED').length }} />
       <div className="main-content">
         <Topbar activeTab={activeTab} online={online} />
         <main className="page-wrapper">
-          {activeTab === 'dashboard' && <Dashboard alerts={alerts} incidents={incidents} setActiveTab={setActiveTab} />}
+          {activeTab === 'dashboard' && <Dashboard alerts={alerts} incidents={incidents} stats={stats} setActiveTab={setActiveTab} />}
           {activeTab === 'alerts' && (
             <Alerts
               alerts={alerts}
               loading={loading}
               error={error}
-              refreshAlerts={fetchAlerts}
+              refreshAlerts={refreshAll}
               seedSampleAlerts={seedSampleAlerts}
+              totalAlerts={stats ? stats.alerts.total : undefined}
             />
           )}
           {activeTab === 'incidents' && (
@@ -82,10 +99,11 @@ export default function App() {
               loading={incidentsLoading}
               error={incidentsError}
               refresh={fetchIncidents}
-              refreshAlerts={fetchAlerts}
+              refreshAlerts={refreshAll}
             />
           )}
-          {activeTab === 'agents' && <AgentActivity refreshAlerts={() => { fetchAlerts(); fetchIncidents(); }} />}
+          {activeTab === 'agents' && <AgentActivity refreshAlerts={refreshAll} />}
+          {activeTab === 'audit' && <AuditLog />}
           {activeTab === 'settings' && <Settings />}
         </main>
       </div>

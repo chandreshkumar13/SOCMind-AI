@@ -2,7 +2,7 @@ import React, { useState } from 'react';
 import { Filter, Search, PlusCircle, RefreshCw, AlertTriangle } from 'lucide-react';
 import StatusBadge from '../components/StatusBadge';
 import { api } from '../api';
-import { reputationKey } from '../lib/view';
+import { reputationKey, truncationNote } from '../lib/view';
 
 // Triage and enrichment results stored on the alert (normalized_data.triage / .enrichment)
 export function AnalysisPanels({ alert, busy, onRun, runError }) {
@@ -65,7 +65,7 @@ export function AnalysisPanels({ alert, busy, onRun, runError }) {
   );
 }
 
-export default function Alerts({ alerts, loading, error, refreshAlerts, seedSampleAlerts }) {
+export default function Alerts({ alerts, loading, error, refreshAlerts, seedSampleAlerts, totalAlerts }) {
   const [analysisBusy, setAnalysisBusy] = useState(false);
   const [analysisError, setAnalysisError] = useState(null);
   const [filterSeverity, setFilterSeverity] = useState('ALL');
@@ -258,6 +258,12 @@ export default function Alerts({ alerts, loading, error, refreshAlerts, seedSamp
           >
             Retry Connection
           </button>
+        </div>
+      )}
+
+      {!loading && truncationNote(alerts.length, totalAlerts) && (
+        <div style={{ fontSize: '12px', color: '#fde047', marginBottom: '10px' }}>
+          {truncationNote(alerts.length, totalAlerts)} Filters apply to the loaded alerts only.
         </div>
       )}
 

@@ -15,10 +15,29 @@ from app.schemas.alert import (
 )
 from app.services.normalization import NormalizationService
 from app.services.seed import seed_synthetic_alerts
+import logging
+
 from app.services.audit import log_action
 from app.services.pipeline_steps import triage_alert_record, enrich_alert_record
 
 router = APIRouter()
+logger = logging.getLogger("socmind.alerts")
+
+
+def _run_step(db: Session, alert: AlertModel, agent_name: str, step):
+    """Runs a triage/enrichment step. On failure nothing is saved except an audit entry, and the client gets a 502."""
+    alert_id = alert.id
+    try:
+        return step(db, alert)
+    except Exception as exc:  # noqa: BLE001 - reported, not swallowed
+        db.rollback()
+        logger.exception("%s failed for alert %s", agent_name, alert_id)
+        log_action(db, agent_name, "AGENT_FAILED", alert_id, {"error": f"{type(exc).__name__}: {exc}"[:300]})
+        db.commit()
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=f"{agent_name} failed ({type(exc).__name__}); the alert was not modified. See the audit log."
+        )
 
 
 @router.post("/alerts", response_model=AlertResponse, status_code=status.HTTP_201_CREATED, summary="Ingest Security Alert")
@@ -37,6 +56,17 @@ def ingest_alert(payload: AlertIngestRequest, db: Session = Depends(get_db)):
             status_code=status.HTTP_409_CONFLICT,
             detail=f"Alert with ID {normalized['id']} already exists."
         )
+
+    # The same upstream alert (same source system + upstream ID) must not be ingested twice
+    upstream_id = raw_dict.get("external_alert_id") or raw_dict.get("external_id")
+    if upstream_id:
+        duplicate = db.query(AlertModel).filter(AlertModel.source == normalized["source"],
+                                                AlertModel.external_alert_id == normalized["external_alert_id"]).first()
+        if duplicate:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=f"Duplicate alert: {duplicate.id} already has external_alert_id {upstream_id} from {normalized['source']}."
+            )
 
     alert_record = AlertModel(
         id=normalized["id"],
@@ -134,7 +164,7 @@ def triage_alert(alert_id: str, db: Session = Depends(get_db)):
         )
 
     # Stores the triage result and audits it. A CLOSED alert keeps its status (it is never re-opened).
-    triage_result = triage_alert_record(db, alert)
+    triage_result = _run_step(db, alert, "Triage Agent", triage_alert_record)
 
     db.commit()
     db.refresh(alert)
@@ -162,7 +192,7 @@ def enrich_alert(alert_id: str, db: Session = Depends(get_db)):
         )
 
     # Stores the enrichment result and audits it. A CLOSED alert keeps its status.
-    enrichment_result = enrich_alert_record(db, alert)
+    enrichment_result = _run_step(db, alert, "Enrichment Agent", enrich_alert_record)
 
     db.commit()
     db.refresh(alert)

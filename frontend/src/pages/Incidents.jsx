@@ -5,7 +5,7 @@ import PipelineRunReport from '../components/PipelineRunReport';
 import { ActionButton, EmptyCard, ErrorCard, LoadingCard } from '../components/StateCards';
 import { api } from '../api';
 import useAsync from '../lib/useAsync';
-import { formatUtc, groupFindings, reviewState, statusLabel } from '../lib/view';
+import { formatUtc, groupFindings, reviewState, simulationState, statusLabel } from '../lib/view';
 
 const sectionTitle = { fontSize: '12px', color: 'var(--accent-cyan)', textTransform: 'uppercase', letterSpacing: '0.05em', fontWeight: 700, marginBottom: '8px' };
 const panel = { background: 'rgba(0, 0, 0, 0.2)', padding: '12px 16px', borderRadius: 'var(--radius-sm)', border: '1px solid var(--border-color)', marginBottom: '14px' };
@@ -76,6 +76,9 @@ export function Investigation({ inv }) {
           {entityLine('Hosts', inv.entities.hosts)}{entityLine('Users', inv.entities.users)}{entityLine('IPs', inv.entities.ips)}
           {entityLine('Hashes', (inv.entities.hashes || []).map((h) => `${h.slice(0, 16)}...`))}{entityLine('Domains (heuristic)', inv.entities.domains)}
         </div>
+        {inv.log_source && (
+          <div style={{ ...muted, marginTop: '8px' }}>Log source: <span className="code-font">{inv.log_source.path}</span> — {inv.log_source.note}</div>
+        )}
         {(inv.limitations || []).length > 0 && (
           <ul style={{ margin: '10px 0 0 18px', fontSize: '12px', color: '#fde047' }}>
             {inv.limitations.map((l, i) => <li key={i}>{l}</li>)}
@@ -142,6 +145,7 @@ export function Recommendations({ recs, response }) {
               <StatusBadge severity={r.impact === 'HIGH' ? 'high' : r.impact === 'MEDIUM' ? 'medium' : 'low'} label={`Impact ${r.impact}`} />
               <StatusBadge severity={String(r.status).toLowerCase()} label={r.status} />
               <StatusBadge severity="low" label={r.executed ? 'EXECUTED' : 'NOT EXECUTED'} />
+              <StatusBadge severity={r.simulation_status === 'SIMULATED' ? 'medium' : 'low'} label={`Simulation: ${r.simulation_status || 'NOT_RUN'}`} />
             </div>
           </div>
           <div style={{ fontSize: '12px', marginTop: '6px' }}>{r.justification}</div>
@@ -194,6 +198,53 @@ export function Review({ incident, onDecide, busy }) {
   );
 }
 
+export function Simulation({ incident, onSimulate, busy }) {
+  const [actor, setActor] = useState('');
+  const state = simulationState(incident);
+  const sim = (incident.details || {}).simulation;
+  const input = { padding: '8px 10px', borderRadius: 'var(--radius-sm)', border: '1px solid var(--border-color)', background: 'var(--bg-dark)', color: 'var(--text-main)', fontSize: '13px' };
+  if (incident.human_approval_status !== 'APPROVED' && !sim) return null;
+  return (
+    <div style={{ ...panel, display: 'flex', flexDirection: 'column', gap: '10px' }}>
+      <div style={sectionTitle}>Response simulation</div>
+      {sim && (
+        <div style={{ fontSize: '13px' }}>
+          <StatusBadge severity="medium" label="SIMULATED" /> by <strong>{sim.simulated_by}</strong> at {formatUtc(sim.simulated_at)}
+          {sim.reason && <> — “{sim.reason}”</>}
+          <ul style={{ margin: '8px 0 0 18px' }}>
+            {sim.actions.map((a) => <li key={a.id}>{a.id}: {a.action} <span style={muted}>— {a.outcome}</span></li>)}
+          </ul>
+          <div style={{ ...muted, marginTop: '6px' }}>{sim.note}</div>
+        </div>
+      )}
+      {!sim && !state.canSimulate && <div style={muted}>{state.reason}</div>}
+      {state.canSimulate && (
+        <>
+          <div style={muted}>Approved is not executed. A simulation rehearses the approved actions on record only; no command is run and no system is changed.</div>
+          <input style={input} placeholder="Your name (required)" value={actor} onChange={(e) => setActor(e.target.value)} maxLength={100} />
+          <div><ActionButton busy={busy} disabled={!actor.trim()} onClick={() => onSimulate(actor.trim())}>Run simulation (no real action)</ActionButton></div>
+        </>
+      )}
+    </div>
+  );
+}
+
+export function ReviewHistory({ history }) {
+  if (!history || history.length === 0) return null;
+  return (
+    <div style={panel}>
+      <div style={sectionTitle}>Earlier decisions (no longer current)</div>
+      <div style={{ ...muted, marginBottom: '6px' }}>New correlated alerts changed the incident, so these decisions were voided and a new review is needed.</div>
+      {history.map((h, i) => (
+        <div key={i} style={{ fontSize: '13px', padding: '3px 0' }}>
+          {h.review ? <><StatusBadge severity={h.review.decision.toLowerCase()} label={h.review.decision} /> by <strong>{h.review.reviewer}</strong> at {formatUtc(h.review.reviewed_at)}</> : 'Decision details unavailable'}
+          {h.simulation && <> · simulated by {h.simulation.simulated_by}</>} · voided {formatUtc(h.superseded_at)}
+        </div>
+      ))}
+    </div>
+  );
+}
+
 function IncidentDetail({ id, onChanged }) {
   const { loading, error, data: inc, reload } = useAsync(() => api(`/incidents/${id}`), [id]);
   const [busy, setBusy] = useState(false);
@@ -236,6 +287,9 @@ function IncidentDetail({ id, onChanged }) {
       <Recommendations recs={details.recommendations} response={details.response} />
       <Review incident={inc} busy={busy}
         onDecide={(decision, reviewer, reason) => act(() => api(`/incidents/${id}/${decision}`, { method: 'POST', body: { reviewer, reason: reason || null } }))} />
+      <Simulation incident={inc} busy={busy}
+        onSimulate={(actor) => act(() => api(`/incidents/${id}/simulate`, { method: 'POST', body: { reviewer: actor } }))} />
+      <ReviewHistory history={details.review_history} />
     </div>
   );
 }
@@ -312,7 +366,7 @@ export default function Incidents({ incidents, loading, error, refresh, refreshA
                 </div>
                 <div style={{ padding: '4px 12px', borderRadius: '9999px', background: 'rgba(234, 179, 8, 0.1)', border: '1px solid rgba(234, 179, 8, 0.3)', color: '#fde047', fontSize: '12px', fontWeight: 600, display: 'flex', alignItems: 'center', gap: '6px', whiteSpace: 'nowrap' }}>
                   <UserCheck size={14} />
-                  {inc.human_approval_status === 'PENDING' ? 'Awaiting analyst decision' : `Decision: ${inc.human_approval_status}`}
+                  {inc.human_approval_status === 'PENDING' ? 'Awaiting analyst decision' : `Decision: ${inc.human_approval_status}${inc.status === 'RESPONSE_SIMULATED' ? ' · simulated' : ' · not executed'}`}
                 </div>
               </div>
 

@@ -7,7 +7,7 @@ from app.db.session import get_db
 from app.models.models import AlertModel, IncidentModel
 from app.schemas.incident import CorrelateRequest, IncidentDetailOut, IncidentOut, ReviewRequest
 from app.services.incident_service import (
-    DecisionError, correlate_and_store, investigate_incident, recommend_for_incident, review_incident,
+    DecisionError, correlate_and_store, investigate_incident, recommend_for_incident, review_incident, simulate_response,
 )
 
 router = APIRouter()
@@ -91,3 +91,14 @@ def approve(incident_id: str, payload: ReviewRequest, db: Session = Depends(get_
 @router.post("/incidents/{incident_id}/reject", response_model=IncidentDetailOut, summary="Reject the Proposed Response")
 def reject(incident_id: str, payload: ReviewRequest, db: Session = Depends(get_db)):
     return _review(incident_id, "REJECTED", payload, db)
+
+
+@router.post("/incidents/{incident_id}/simulate", response_model=IncidentDetailOut, summary="Simulate the Approved Response")
+def simulate(incident_id: str, payload: ReviewRequest, db: Session = Depends(get_db)):
+    """Rehearses an APPROVED response. Nothing is executed: the system has no real response integration."""
+    inc = _get_incident(db, incident_id)
+    try:
+        simulate_response(db, inc, payload.reviewer, payload.reason)
+    except DecisionError as e:
+        raise HTTPException(status.HTTP_409_CONFLICT, str(e))
+    return get_incident(incident_id, db)

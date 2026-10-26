@@ -6,7 +6,8 @@ import {
   FolderGit2, 
   Cpu, 
   Settings,
-  ShieldCheck
+  ShieldCheck,
+  FileText
 } from 'lucide-react';
 
 export default function Sidebar({ activeTab, setActiveTab, counts = {} }) {
@@ -15,6 +16,7 @@ export default function Sidebar({ activeTab, setActiveTab, counts = {} }) {
     { id: 'alerts', label: 'Security Alerts', icon: AlertTriangle, badge: counts.alerts ? String(counts.alerts) : null },
     { id: 'incidents', label: 'Correlated Incidents', icon: FolderGit2, badge: counts.incidents ? String(counts.incidents) : null },
     { id: 'agents', label: 'Agent Pipeline', icon: Cpu },
+    { id: 'audit', label: 'Audit Log', icon: FileText, badge: counts.audit ? String(counts.audit) : null },
     { id: 'settings', label: 'Settings & Config', icon: Settings },
   ];
 
