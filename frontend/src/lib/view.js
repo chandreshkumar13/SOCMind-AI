@@ -50,6 +50,9 @@ export function reviewState(incident) {
   if (!details.recommendations || details.recommendations.length === 0) {
     return { canReview: false, reason: 'No recommendation yet. Generate recommendations first.' };
   }
+  if (recommendationView(details).kind === 'superseded') {
+    return { canReview: false, reason: 'These recommendations were superseded when an earlier decision was withdrawn. Generate new recommendations first.' };
+  }
   if (details.recommendations_stale) {
     return { canReview: false, reason: 'The incident changed after these recommendations were made. Regenerate them first.' };
   }
@@ -57,6 +60,43 @@ export function reviewState(incident) {
     return { canReview: false, reason: `A decision is already recorded: ${incident.human_approval_status}.` };
   }
   return { canReview: true, reason: '' };
+}
+
+/**
+ * What the recommendations panel may present. `superseded`: an earlier decision was withdrawn, so these are history and not
+ * proposals. `current`: live proposals. `none`: nothing has been generated.
+ */
+export function recommendationView(details) {
+  const recs = Array.isArray(details && details.recommendations) ? details.recommendations.filter(Boolean) : [];
+  if (recs.length === 0) return { kind: 'none', recommendations: [], reason: '', supersededAt: null };
+  const history = Array.isArray(details.review_history) ? details.review_history : [];
+  const last = history.length ? history[history.length - 1] : {};
+  // Marked SUPERSEDED when withdrawn. Records withdrawn before that mark existed still carry a decision's marks while no
+  // decision is in force (no `review`), so they are history too and must not read as current proposals.
+  const legacyWithdrawn = !details.review
+    && recs.some((r) => r.status === 'APPROVED' || r.status === 'REJECTED' || r.simulation_status === 'SIMULATED');
+  if (legacyWithdrawn || recs.every((r) => r.status === 'SUPERSEDED')) {
+    return {
+      kind: 'superseded', recommendations: recs,
+      reason: recs[0].superseded_by || last.superseded_by || 'the analysis they were based on changed',
+      supersededAt: recs[0].superseded_at || last.superseded_at || null,
+    };
+  }
+  return { kind: 'current', recommendations: recs, reason: '', supersededAt: null };
+}
+
+/**
+ * The warning shown before re-investigating an incident with a recorded decision: the decision (and any simulation of it)
+ * is withdrawn and kept in the review history. Null when nothing would be withdrawn (a pending incident).
+ */
+export function reinvestigationNotice(incident) {
+  const decision = incident && incident.human_approval_status;
+  if (!decision || decision === 'PENDING') return null;
+  const details = (incident && incident.details) || {};
+  const reviewer = details.review && details.review.reviewer ? ` by ${details.review.reviewer}` : '';
+  const simulation = details.simulation ? ' and its simulation' : '';
+  return `The ${String(decision).toLowerCase()} decision${reviewer}${simulation} will be withdrawn and saved in the review history. `
+    + 'Its recommendations are marked superseded, and the incident returns to PENDING for a new review. Nothing is executed.';
 }
 
 /** "2026-09-03T08:14:00Z" -> "2026-09-03 08:14:00 UTC"; unknown stays unknown (never invented). */

@@ -5,6 +5,7 @@ import {
   simulationState, auditQuery, previewDetails, truncationNote,
   reputationSource, lookupStatusLabel, isRetryableLookup, detectionLabel, safeVirusTotalUrl, enrichmentNotices,
   intelSource, refreshedSelection, alertSearchPath, searchCapNote, fetchAlertSearch,
+  recommendationView, reinvestigationNotice,
 } from './view.js';
 
 test('alertSearchPath trims the query, URL-encodes it and returns null for an empty query', () => {
@@ -294,4 +295,65 @@ test('Alerts search takes its result from fetchAlertSearch on every outcome (wir
   assert.match(source, /setSearchResult\(next\.result\);/);
   assert.match(source, /setSearchError\(next\.error\);/);
   assert.doesNotMatch(source, /setSearchResult\(\{ term:/);   // the old write that kept earlier rows on failure is gone
+});
+
+// ---- superseded recommendations and the re-investigation warning ------------------------------------------------
+test('recommendationView tells current proposals from superseded history', () => {
+  assert.deepEqual(recommendationView(null), { kind: 'none', recommendations: [], reason: '', supersededAt: null });
+  assert.equal(recommendationView({ recommendations: [] }).kind, 'none');
+  assert.equal(recommendationView({ recommendations: [{ id: 'REC-1', status: 'PENDING' }] }).kind, 'current');
+  const withdrawn = recommendationView({ recommendations: [
+    { id: 'REC-1', status: 'SUPERSEDED', superseded_by: 'the analysis changed', superseded_at: '2026-10-28T09:00:00Z' },
+    { id: 'REC-2', status: 'SUPERSEDED', superseded_by: 'the analysis changed', superseded_at: '2026-10-28T09:00:00Z' }] });
+  assert.equal(withdrawn.kind, 'superseded');
+  assert.equal(withdrawn.reason, 'the analysis changed');
+  assert.equal(withdrawn.supersededAt, '2026-10-28T09:00:00Z');
+});
+
+test('recommendations left marked APPROVED by an older withdrawal read as superseded, not current', () => {
+  const legacy = recommendationView({
+    recommendations: [{ id: 'REC-1', status: 'APPROVED', simulation_status: 'SIMULATED', executed: false }],
+    review_history: [{ superseded_at: '2026-10-28T09:00:00Z', superseded_by: 'threat intelligence changed' }],
+  });
+  assert.equal(legacy.kind, 'superseded');
+  assert.equal(legacy.reason, 'threat intelligence changed');
+  assert.equal(legacy.supersededAt, '2026-10-28T09:00:00Z');
+  // A decision still in force keeps its own recommendations as current
+  assert.equal(recommendationView({ review: { decision: 'APPROVED' }, recommendations: [{ id: 'REC-1', status: 'APPROVED' }] }).kind, 'current');
+});
+
+test('reinvestigationNotice warns about a recorded decision and stays silent for a pending incident', () => {
+  assert.equal(reinvestigationNotice({ human_approval_status: 'PENDING', details: {} }), null);
+  assert.equal(reinvestigationNotice(null), null);
+  const approved = reinvestigationNotice({ human_approval_status: 'APPROVED',
+    details: { review: { decision: 'APPROVED', reviewer: 'Analyst A' }, simulation: { simulated_by: 'Analyst B' } } });
+  assert.match(approved, /approved decision by Analyst A and its simulation will be withdrawn/);
+  assert.match(approved, /saved in the review history/);
+  assert.match(approved, /superseded/);
+  assert.match(reinvestigationNotice({ human_approval_status: 'REJECTED', details: {} }), /The rejected decision will be withdrawn/);
+  const legacy = reinvestigationNotice({ human_approval_status: 'APPROVED', details: null });
+  assert.match(legacy, /The approved decision will be withdrawn/);
+  assert.doesNotMatch(legacy, /undefined/);
+});
+
+test('a superseded recommendation set cannot be approved, and the reason says why', () => {
+  const state = reviewState({ human_approval_status: 'PENDING',
+    details: { recommendations: [{ id: 'REC-1', status: 'SUPERSEDED' }], recommendations_stale: true } });
+  assert.equal(state.canReview, false);
+  assert.match(state.reason, /superseded when an earlier decision was withdrawn/);
+});
+
+test('Incidents page asks before re-investigating a decided incident (wiring guard)', async () => {
+  const { readFileSync } = await import('node:fs');
+  const source = readFileSync(new URL('../pages/Incidents.jsx', import.meta.url), 'utf8');
+  assert.match(source, /reinvestigationNotice\(inc\)/);
+  assert.match(source, /export function ReinvestigateConfirm\(/);
+  assert.match(source, /<ReinvestigateConfirm/);
+  assert.match(source, /Withdraw decision and re-investigate/);
+});
+
+test('the stale notice takes the superseded state from recommendationView (wiring guard)', async () => {
+  const { readFileSync } = await import('node:fs');
+  const source = readFileSync(new URL('../components/StaleNotice.jsx', import.meta.url), 'utf8');
+  assert.match(source, /recommendationView\(details\)/);
 });

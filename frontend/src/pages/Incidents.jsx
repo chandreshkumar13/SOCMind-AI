@@ -6,7 +6,7 @@ import StaleNotice from '../components/StaleNotice';
 import { ActionButton, EmptyCard, ErrorCard, LoadingCard } from '../components/StateCards';
 import { api } from '../api';
 import useAsync from '../lib/useAsync';
-import { formatUtc, groupFindings, reviewState, safeVirusTotalUrl, simulationState, statusLabel } from '../lib/view';
+import { formatUtc, groupFindings, recommendationView, reinvestigationNotice, reviewState, safeVirusTotalUrl, simulationState, statusLabel } from '../lib/view';
 import {
   APPROVAL_FILTERS, DEFAULT_CRITERIA, SEVERITY_ORDER, SORT_OPTIONS, STATUS_FILTERS,
   filterAndSortIncidents, isDefaultView, shownSummary,
@@ -150,8 +150,34 @@ export function Investigation({ inv }) {
   );
 }
 
-export function Recommendations({ recs, response }) {
-  if (!recs || recs.length === 0) return <div style={{ ...panel, ...muted }}>No recommendations yet.</div>;
+// Recommendations whose decision was withdrawn: kept as history, never shown as current proposals.
+function SupersededRecommendations({ view }) {
+  const recs = view.recommendations;
+  const when = view.supersededAt ? ` ${formatUtc(view.supersededAt)}` : '';
+  return (
+    <div style={{ ...panel, borderColor: 'rgba(148, 163, 184, 0.4)' }}>
+      <div style={{ ...sectionTitle, color: 'var(--text-muted)' }}>Superseded recommendations, not current ({recs.length})</div>
+      <div style={{ ...muted, marginBottom: '10px' }}>
+        These are the proposals an earlier decision was based on. That decision was withdrawn{when}: {view.reason}.
+        They are kept for the record only. Nothing was executed.
+      </div>
+      {recs.map((r) => (
+        <div key={r.id} style={{ padding: '8px 12px', marginBottom: '8px', borderRadius: 'var(--radius-sm)', border: '1px dashed var(--border-color)', opacity: 0.75 }}>
+          <div style={{ fontWeight: 600, fontSize: '13px' }}>{r.id} · {r.action}</div>
+          <div style={{ marginTop: '4px' }}><StatusBadge severity="low" label="SUPERSEDED" /></div>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+// Takes the whole incident details: whether a decision is in force decides if the recommendations are current or history.
+export function Recommendations({ details }) {
+  const view = recommendationView(details);
+  const recs = view.recommendations;
+  const response = (details && details.response) || null;
+  if (view.kind === 'none') return <div style={{ ...panel, ...muted }}>No recommendations yet.</div>;
+  if (view.kind === 'superseded') return <SupersededRecommendations view={view} />;
   const list = (items) => (items && items.length ? items.join(' · ') : 'none');
   return (
     <div style={{ ...panel, borderColor: 'rgba(124, 58, 237, 0.3)' }}>
@@ -255,14 +281,37 @@ export function ReviewHistory({ history }) {
   if (!history || history.length === 0) return null;
   return (
     <div style={panel}>
-      <div style={sectionTitle}>Earlier decisions (no longer current)</div>
-      <div style={{ ...muted, marginBottom: '6px' }}>New correlated alerts changed the incident, so these decisions were voided and a new review is needed.</div>
+      <div style={sectionTitle}>Earlier decisions (historical, no longer current)</div>
+      <div style={{ ...muted, marginBottom: '6px' }}>
+        Withdrawn decisions, kept with the recommendations they were based on. None of them applies to the current analysis.
+      </div>
       {history.map((h, i) => (
-        <div key={i} style={{ fontSize: '13px', padding: '3px 0' }}>
+        <div key={i} style={{ fontSize: '13px', padding: '6px 0', borderBottom: '1px solid var(--border-color)' }}>
           {h.review ? <><StatusBadge severity={h.review.decision.toLowerCase()} label={h.review.decision} /> by <strong>{h.review.reviewer}</strong> at {formatUtc(h.review.reviewed_at)}</> : 'Decision details unavailable'}
-          {h.simulation && <> · simulated by {h.simulation.simulated_by}</>} · voided {formatUtc(h.superseded_at)}
+          {h.simulation && <> · simulated by {h.simulation.simulated_by}</>}
+          <div style={muted}>Withdrawn {formatUtc(h.superseded_at)}{h.superseded_by ? `: ${h.superseded_by}` : ''}</div>
+          {(h.recommendations || []).length > 0 && (
+            <div style={muted}>
+              Recommendations at the time ({h.recommendations.length}): {h.recommendations.map((r) => `${r.action} [${r.status}${r.simulation_status === 'SIMULATED' ? ', simulated' : ''}]`).join('; ')}
+            </div>
+          )}
         </div>
       ))}
+    </div>
+  );
+}
+
+// Asks before re-investigating an incident that has a recorded decision. Renders nothing when nothing would be withdrawn.
+export function ReinvestigateConfirm({ notice, busy, onConfirm, onCancel }) {
+  if (!notice) return null;
+  return (
+    <div style={{ ...panel, borderColor: 'rgba(234, 179, 8, 0.5)', display: 'flex', flexDirection: 'column', gap: '10px' }}>
+      <div style={{ ...sectionTitle, color: '#fde047' }}>Withdraw the recorded decision?</div>
+      <div style={{ fontSize: '13px' }}>{notice}</div>
+      <div style={{ display: 'flex', gap: '10px', flexWrap: 'wrap' }}>
+        <ActionButton variant="danger" busy={busy} onClick={onConfirm}>Withdraw decision and re-investigate</ActionButton>
+        <ActionButton variant="ghost" disabled={busy} onClick={onCancel}>Cancel</ActionButton>
+      </div>
     </div>
   );
 }
@@ -271,6 +320,7 @@ function IncidentDetail({ id, onChanged }) {
   const { loading, error, data: inc, reload } = useAsync(() => api(`/incidents/${id}`), [id]);
   const [busy, setBusy] = useState(false);
   const [actionError, setActionError] = useState(null);
+  const [confirming, setConfirming] = useState(false);   // the re-investigation warning is open
 
   const act = async (fn) => {
     setBusy(true);
@@ -286,6 +336,8 @@ function IncidentDetail({ id, onChanged }) {
     }
   };
 
+  const reinvestigate = () => act(() => api(`/incidents/${id}/investigate`, { method: 'POST' }));
+
   if (loading && !inc) return <LoadingCard>Loading incident {id}...</LoadingCard>;
   if (error && !inc) return <ErrorCard title="Could not load incident" message={error} onRetry={reload} />;
   const details = inc.details || {};
@@ -294,15 +346,18 @@ function IncidentDetail({ id, onChanged }) {
       {actionError && <ErrorCard title="Action not completed" message={actionError} />}
       <StaleNotice details={details} />
       <div style={{ display: 'flex', gap: '10px', marginBottom: '14px', flexWrap: 'wrap' }}>
-        <ActionButton variant="ghost" busy={busy} onClick={() => act(() => api(`/incidents/${id}/investigate`, { method: 'POST' }))}>Re-run investigation</ActionButton>
+        <ActionButton variant="ghost" busy={busy} title={reinvestigationNotice(inc) || ''}
+          onClick={() => (reinvestigationNotice(inc) ? setConfirming(true) : reinvestigate())}>Re-run investigation</ActionButton>
         <ActionButton variant="ghost" busy={busy} disabled={inc.human_approval_status !== 'PENDING'}
           title={inc.human_approval_status !== 'PENDING' ? 'A decision is recorded; recommendations are locked' : ''}
           onClick={() => act(() => api(`/incidents/${id}/recommend`, { method: 'POST' }))}>Generate recommendations</ActionButton>
       </div>
+      <ReinvestigateConfirm notice={confirming ? reinvestigationNotice(inc) : null} busy={busy}
+        onConfirm={() => { setConfirming(false); reinvestigate(); }} onCancel={() => setConfirming(false)} />
       <Correlation correlation={details.correlation} />
       <CorrelatedAlerts alerts={inc.alerts || []} />
       <Investigation inv={details.investigation} />
-      <Recommendations recs={details.recommendations} response={details.response} />
+      <Recommendations details={details} />
       <Review incident={inc} busy={busy}
         onDecide={(decision, reviewer, reason) => act(() => api(`/incidents/${id}/${decision}`, { method: 'POST', body: { reviewer, reason: reason || null } }))} />
       <Simulation incident={inc} busy={busy}

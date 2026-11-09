@@ -27,6 +27,7 @@ from sqlalchemy.orm import Session
 
 from app.models.models import AlertModel, IncidentModel
 from app.services.audit import log_action
+from app.services.incident_state import active_incidents_clause
 from app.services.incident_service import (
     DecisionError, correlate_and_store, investigate_incident, recommend_for_incident,
 )
@@ -132,12 +133,12 @@ class PipelineOrchestrator:
         db.commit()
 
         # Investigation: new/updated incidents and any whose investigation is missing or stale
-        incidents = db.query(IncidentModel).filter(IncidentModel.status != "MERGED").all()
+        incidents = db.query(IncidentModel).filter(active_incidents_clause()).all()
         to_investigate = [i.id for i in incidents if not (i.details or {}).get("investigation") or (i.details or {}).get("investigation_stale")]
         stages.append(self._per_item_stage(db, "Investigation Agent", to_investigate, None, lambda inc: investigate_incident(db, inc), model=IncidentModel))
 
         db.expire_all()
-        incidents = db.query(IncidentModel).filter(IncidentModel.status != "MERGED").all()
+        incidents = db.query(IncidentModel).filter(active_incidents_clause()).all()
         to_recommend = [i.id for i in incidents
                         if i.human_approval_status == "PENDING"
                         and ((i.details or {}).get("recommendations_stale") or not (i.details or {}).get("recommendations"))]

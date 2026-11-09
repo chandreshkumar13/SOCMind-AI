@@ -9,6 +9,7 @@ from app.schemas.incident import CorrelateRequest, IncidentDetailOut, IncidentOu
 from app.services.incident_service import (
     DecisionError, correlate_and_store, investigate_incident, recommend_for_incident, review_incident, simulate_response,
 )
+from app.services.incident_state import active_incidents_clause
 from app.services.orchestrator import PipelineBusy, pipeline_lock
 
 router = APIRouter()
@@ -30,7 +31,7 @@ def list_incidents(
     offset: int = Query(0, ge=0),
     db: Session = Depends(get_db),
 ):
-    q = db.query(IncidentModel)
+    q = db.query(IncidentModel).filter(active_incidents_clause())     # merged incidents are never part of the active list
     if severity:
         q = q.filter(IncidentModel.severity == severity.upper())
     if incident_status:
@@ -64,7 +65,10 @@ def correlate(payload: Optional[CorrelateRequest] = None, db: Session = Depends(
 def investigate(incident_id: str, db: Session = Depends(get_db)):
     """Builds the timeline and labelled findings (verified / mock_intel / hypothesis) for an incident."""
     inc = _get_incident(db, incident_id)
-    investigate_incident(db, inc)
+    try:
+        investigate_incident(db, inc)
+    except DecisionError as e:
+        raise HTTPException(status.HTTP_409_CONFLICT, str(e))
     return get_incident(incident_id, db)
 
 

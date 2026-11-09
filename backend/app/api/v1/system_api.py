@@ -7,28 +7,33 @@ from sqlalchemy.orm import Session
 from app.core.config import EXECUTION_MODE, settings
 from app.db.session import get_db
 from app.models.models import AlertModel, AuditLogModel, IncidentModel
+from app.services.incident_state import active_incidents_clause
 from app.services.log_store import LOG_SOURCE_PATH
 from app.services.threat_intel import api_key_configured, quota_snapshot, resolve_provider
 
 router = APIRouter()
 
 
-def _counts(db: Session, column) -> Dict[str, int]:
-    return {key or "UNKNOWN": n for key, n in db.query(column, func.count()).group_by(column).all()}
+def _counts(db: Session, column, where=None) -> Dict[str, int]:
+    query = db.query(column, func.count())
+    if where is not None:
+        query = query.filter(where)
+    return {key or "UNKNOWN": n for key, n in query.group_by(column).all()}
 
 
 @router.get("/stats", summary="Dashboard Statistics")
 def stats(db: Session = Depends(get_db)) -> Dict[str, Any]:
-    """True totals computed in the database (list endpoints are paginated, so counting their results would be wrong)."""
-    incident_status = _counts(db, IncidentModel.status)
-    open_incidents = {k: v for k, v in incident_status.items() if k != "MERGED"}
+    """True totals computed in the database (list endpoints are paginated, so counting their results would be wrong).
+    Incidents are counted only while they are active: a merged incident is folded into another and is not counted."""
+    active = active_incidents_clause()
+    incident_status = _counts(db, IncidentModel.status, active)
     awaiting = (db.query(func.count(IncidentModel.id))
-                .filter(IncidentModel.status == "RESPONSE_PROPOSED", IncidentModel.human_approval_status == "PENDING").scalar() or 0)
+                .filter(active, IncidentModel.status == "RESPONSE_PROPOSED", IncidentModel.human_approval_status == "PENDING").scalar() or 0)
     return {
         "alerts": {"total": db.query(func.count(AlertModel.id)).scalar() or 0,
                    "by_severity": _counts(db, AlertModel.severity), "by_status": _counts(db, AlertModel.status)},
-        "incidents": {"total": sum(open_incidents.values()), "by_status": open_incidents,
-                      "by_severity": {k: v for k, v in _counts(db, IncidentModel.severity).items()},
+        "incidents": {"total": sum(incident_status.values()), "by_status": incident_status,
+                      "by_severity": _counts(db, IncidentModel.severity, active),
                       "awaiting_human_review": awaiting},
         "audit_entries": db.query(func.count(AuditLogModel.id)).scalar() or 0,
     }

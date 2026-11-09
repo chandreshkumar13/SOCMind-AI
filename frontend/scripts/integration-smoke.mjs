@@ -200,9 +200,10 @@ try {
   absent('incident list has no demo data', t, 'INC-2026-089', 'Simulated Action');
   t = html(h(Inc.Investigation, { inv: pending.details.investigation }));
   check('investigation separates evidence classes', t, /Verified facts[\s\S]*Mock threat intelligence[\s\S]*Hypotheses/, 'Log source:', 'synthetic', 'UTC');
-  t = html(h(Inc.Recommendations, { recs: simulated.details.recommendations, response: simulated.details.response }));
+  t = html(h(Inc.Recommendations, { details: simulated.details }));
   check('recommendations', t, 'NOT EXECUTED', 'Simulation: SIMULATED', 'Risk if wrong', 'Rollback', 'Required approvals');
   absent('nothing is shown as executed', t, '>EXECUTED<');
+  absent('a decision in force is never shown as superseded history', t, 'Superseded recommendations');
   t = html(h(Inc.Review, { incident: pending, onDecide: noop, busy: false }));
   check('pending review', t, 'Approve proposal', 'Reject proposal');
   t = html(h(Inc.Simulation, { incident: approved, onSimulate: noop, busy: false }));
@@ -213,6 +214,39 @@ try {
   absent('simulated incident cannot be simulated twice', t, 'Run simulation');
   t = html(h(Inc.Simulation, { incident: pending, onSimulate: noop, busy: false }));
   expect('undecided incident shows no simulation panel', t === '');
+
+  // ---- a decided incident: re-investigating it asks first, then withdraws the decision and supersedes its recommendations
+  const Stale = (await load('/src/components/StaleNotice.jsx')).default;
+  const notice = view.reinvestigationNotice(approved);
+  t = html(h(Inc.ReinvestigateConfirm, { notice, busy: false, onConfirm: noop, onCancel: noop }));
+  check('re-investigating a decided incident asks first', t, 'Withdraw the recorded decision?', 'will be withdrawn and saved in the review history',
+    'Test Analyst', 'Withdraw decision and re-investigate', 'Cancel');
+  expect('a pending incident needs no confirmation',
+    view.reinvestigationNotice(pending) === null && html(h(Inc.ReinvestigateConfirm, { notice: null, busy: false, onConfirm: noop, onCancel: noop })) === '');
+  await api(`/incidents/${dc.id}/investigate`, { method: 'POST' });
+  const withdrawn = await api(`/incidents/${dc.id}`);
+  expect('re-investigation withdraws the approval and keeps it in the review history',
+    withdrawn.human_approval_status === 'PENDING' && withdrawn.details.review_history?.length === 1
+      && withdrawn.details.review_history[0].review.decision === 'APPROVED');
+  expect('withdrawn recommendations are superseded, never current',
+    withdrawn.details.recommendations.length > 0
+      && withdrawn.details.recommendations.every((r) => r.status === 'SUPERSEDED' && r.simulation_status === 'SUPERSEDED' && r.executed === false));
+  expect('the primary action is cleared, and the withdrawn one is kept in history',
+    withdrawn.recommended_action === null && withdrawn.details.review_history[0].recommended_action === approved.recommended_action);
+  t = html(h(Inc.Recommendations, { details: withdrawn.details }));
+  check('superseded recommendations are labelled as history', t, 'Superseded recommendations, not current', 'SUPERSEDED', 'withdrawn');
+  absent('superseded recommendations never show as approved or simulated', t, '>APPROVED<', 'Simulation: SIMULATED', 'Run simulation', 'Approve proposal');
+  t = html(h(Inc.ReviewHistory, { history: withdrawn.details.review_history }));
+  check('review history keeps the decision, when it was withdrawn and what it was based on', t, 'Earlier decisions (historical', 'Test Analyst',
+    'Withdrawn', 'Recommendations at the time', 'APPROVED');
+  t = html(h(Inc.Review, { incident: withdrawn, onDecide: noop, busy: false }));
+  check('a withdrawn incident says why it cannot be approved yet', t, 'superseded when an earlier decision was withdrawn');
+  absent('a withdrawn incident offers no approve button', t, 'Approve proposal');
+  t = html(h(Stale, { details: withdrawn.details }));
+  check('the stale notice explains the superseded state', t, 'Recommendations superseded', 'Generate new recommendations before deciding');
+  absent('the superseded state is not described as changed data', t, 'alert data or threat intelligence changed');
+  t = html(h(Inc.Simulation, { incident: withdrawn, onSimulate: noop, busy: false }));
+  expect('a withdrawn incident shows no simulation panel', t === '');
 
   t = html(h(Dash.default, { alerts, incidents, stats, setActiveTab: noop }));
   check('dashboard', t, 'Alerts In Queue', 'Awaiting Human Review', '>10<');

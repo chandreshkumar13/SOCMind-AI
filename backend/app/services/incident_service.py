@@ -9,6 +9,7 @@ from app.agents.correlation.correlation_agent import CorrelationAgent, SEVERITY_
 from app.models.models import AlertModel, IncidentModel
 from app.services.audit import log_action
 from app.services.pipeline_steps import alert_dict
+from app.services.incident_state import active_incidents_clause, is_merged, merged_into_of
 from app.services.staleness import analysis_basis, details_copy as _details, now_iso as _now_iso, void_decision
 
 # Alert statuses an incident step may move forward from (never CLOSED, never backwards)
@@ -61,7 +62,7 @@ def _correlate_once(db: Session, window_hours: int) -> Dict[str, Any]:
     unchanged: List[str] = []
     for group in groups:
         ids = set(group["alert_ids"])
-        overlapping = [i for i in db.query(IncidentModel).filter(IncidentModel.status != "MERGED").order_by(IncidentModel.id).all()
+        overlapping = [i for i in db.query(IncidentModel).filter(active_incidents_clause()).order_by(IncidentModel.id).all()
                        if ids & set(i.correlated_alert_ids or [])]
         correlation_info = {k: group[k] for k in ("shared_entities", "reasons", "confidence", "first_seen", "last_seen", "alert_count")}
         correlation_info["window_hours"] = window_hours
@@ -82,6 +83,10 @@ def _correlate_once(db: Session, window_hours: int) -> Dict[str, Any]:
             merged_ids = sorted(ids | set(target.correlated_alert_ids or []))
             for other in overlapping[1:]:
                 merged_ids = sorted(set(merged_ids) | set(other.correlated_alert_ids or []))
+                if other.human_approval_status != "PENDING":
+                    # A decision on the merged-away incident was made on its own analysis, which no longer stands alone:
+                    # withdraw it (history kept, APPROVAL_RESET audited) so nothing is approved without a new review
+                    void_decision(db, other, agent.agent_name, f"incident merged into {target.id}")
                 other.status = "MERGED"
                 other_details = _details(other)
                 other_details["merged_into"] = target.id
@@ -127,6 +132,7 @@ def investigate_incident(db: Session, incident: IncidentModel) -> Dict[str, Any]
     from app.agents.investigation.investigation_agent import InvestigationAgent
     from app.services.log_store import LOG_SOURCE_PATH, load_sample_logs
 
+    _refuse_if_merged(incident)
     alerts = db.query(AlertModel).filter(AlertModel.id.in_(incident.correlated_alert_ids or [])).all()
     agent = InvestigationAgent()
     details = _details(incident)
@@ -141,6 +147,10 @@ def investigate_incident(db: Session, incident: IncidentModel) -> Dict[str, Any]
     details["investigation_stale"] = False
     details["recommendations_stale"] = True
     incident.details = details
+    if incident.human_approval_status != "PENDING":
+        # The recommendations this decision was based on are now invalid. Withdraw the decision (history kept,
+        # APPROVAL_RESET audited) so the incident is regenerated and reviewed again, not stranded with a decision it cannot use.
+        void_decision(db, incident, agent.agent_name, "re-investigation invalidated the recommendations the decision was based on")
     incident.ai_summary = result["summary"]
     if incident.status in ("OPEN", "INVESTIGATED"):
         incident.status = "INVESTIGATED"
@@ -158,10 +168,25 @@ class DecisionError(Exception):
     """Raised when a review decision is not allowed (mapped to HTTP 409)."""
 
 
+def _refuse_if_merged(incident: IncidentModel) -> None:
+    """A merged incident has been folded into another one, so nothing is decided, recommended, investigated or simulated on it.
+    Recognised by incident_state.is_merged (status or merge mark)."""
+    if is_merged(incident):
+        into = merged_into_of(incident)
+        where = f" into {into}" if into else ""
+        raise DecisionError(f"Incident {incident.id} was merged{where}; act on that incident instead.")
+
+
+def _has_superseded(recs) -> bool:
+    """True when any recommendation was withdrawn with an earlier decision and is therefore history, not a proposal."""
+    return any(isinstance(r, dict) and r.get("status") == "SUPERSEDED" for r in recs or [])
+
+
 def recommend_for_incident(db: Session, incident: IncidentModel) -> Dict[str, Any]:
     """Runs the Response Agent (investigating first if needed) and stores recommendations."""
     from app.agents.response.response_agent import ResponseAgent
 
+    _refuse_if_merged(incident)
     if incident.human_approval_status != "PENDING":
         raise DecisionError("A human decision is already recorded; recommendations can no longer be regenerated.")
     details = _details(incident)
@@ -186,12 +211,15 @@ def recommend_for_incident(db: Session, incident: IncidentModel) -> Dict[str, An
 
 def review_incident(db: Session, incident: IncidentModel, decision: str, reviewer: str, reason: str = None) -> IncidentModel:
     """Records a human APPROVED/REJECTED decision. No action is executed."""
+    _refuse_if_merged(incident)
     details = _details(incident)
     recs = details.get("recommendations")
     if not recs:
         raise DecisionError("There is no recommendation to review; run the recommendation step first.")
     if details.get("recommendations_stale"):
         raise DecisionError("The recommendation is out of date because the incident changed; regenerate it first.")
+    if _has_superseded(recs):
+        raise DecisionError("These recommendations were superseded when an earlier decision was withdrawn; generate new recommendations first.")
     if incident.human_approval_status != "PENDING":
         raise DecisionError(f"A decision ({incident.human_approval_status}) is already recorded for this incident.")
     # Claim the decision atomically: if a concurrent request decided first, this UPDATE matches no row
@@ -221,12 +249,15 @@ def simulate_response(db: Session, incident: IncidentModel, actor: str, reason: 
     APPROVED means "a human agreed to the proposal"; SIMULATED means "the workflow was rehearsed". There is no
     state meaning EXECUTED because SOCMind AI has no real response integration.
     """
+    _refuse_if_merged(incident)
     details = _details(incident)
     recs = details.get("recommendations") or []
     if incident.human_approval_status != "APPROVED":
         raise DecisionError(f"Only an approved response can be simulated (current decision: {incident.human_approval_status}).")
     if details.get("recommendations_stale") or not recs:
         raise DecisionError("The approved recommendations are out of date; regenerate and re-approve them first.")
+    if _has_superseded(recs):
+        raise DecisionError("These recommendations were superseded when an earlier decision was withdrawn; regenerate and re-approve them first.")
     if details.get("simulation") or incident.status == "RESPONSE_SIMULATED":
         raise DecisionError("This approved response was already simulated.")
     claimed = (db.query(IncidentModel)

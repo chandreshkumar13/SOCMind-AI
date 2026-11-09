@@ -23,6 +23,7 @@ from sqlalchemy.orm import Session
 
 from app.models.models import AlertModel, IncidentModel
 from app.services.audit import log_action
+from app.services.incident_state import active_incidents_clause
 
 MAX_STALE_REASONS = 20
 FLAGGED_REPUTATIONS = ("MALICIOUS", "SUSPICIOUS")
@@ -94,16 +95,28 @@ def describe_enrichment_change(old: Any, new: Any) -> Optional[str]:
 def void_decision(db: Session, incident: IncidentModel, actor: str, reason: str) -> None:
     """Withdraws a recorded decision (and any simulation of it) because the analysis it was based on has changed.
 
-    The old decision is kept in details.review_history, the incident returns to PENDING for a new review, and an
-    APPROVAL_RESET audit entry records why. Caller commits.
+    The old decision, its simulation and the recommendations it was based on are kept in details.review_history (the
+    recommendations exactly as the decision saw them). The current recommendations are marked SUPERSEDED, so they are never
+    shown as approved or simulated; the incident's primary action is cleared; the incident returns to PENDING for a new
+    review; and an APPROVAL_RESET audit entry records why. Nothing is deleted. Caller commits.
     """
     previous = incident.human_approval_status
     details = details_copy(incident)
+    superseded_at = now_iso()
     details.setdefault("review_history", []).append({
         "review": details.pop("review", None), "simulation": details.pop("simulation", None),
-        "superseded_at": now_iso(), "superseded_by": reason,
+        "recommendations": copy.deepcopy(details.get("recommendations") or []),
+        "recommended_action": incident.recommended_action,
+        "superseded_at": superseded_at, "superseded_by": reason,
     })
+    for rec in details.get("recommendations") or []:
+        rec.update({"status": "SUPERSEDED", "simulation_status": "SUPERSEDED",
+                    "superseded_at": superseded_at, "superseded_by": reason})
+    # Whatever the decision was based on is no longer current on every withdrawal path: until the recommendations are
+    # regenerated, nothing may be approved or simulated on them
+    details["recommendations_stale"] = True
     incident.details = details
+    incident.recommended_action = None
     log_action(db, actor, "APPROVAL_RESET", incident.id, {"reason": reason, "previous": previous})
     incident.human_approval_status = "PENDING"
     incident.status = "OPEN"
@@ -130,7 +143,7 @@ def mark_incidents_stale_for_alert(db: Session, alert_id: str, change: str, acto
     Incidents without any investigation or recommendation yet are left alone: their next run already uses the latest data.
     """
     marked: List[str] = []
-    for inc in db.query(IncidentModel).filter(IncidentModel.status != "MERGED").order_by(IncidentModel.id).all():
+    for inc in db.query(IncidentModel).filter(active_incidents_clause()).order_by(IncidentModel.id).all():
         if alert_id not in (inc.correlated_alert_ids or []):
             continue
         if not (inc.details or {}).get("investigation") and not (inc.details or {}).get("recommendations"):
@@ -159,7 +172,7 @@ def reconcile_incidents_with_evidence(db: Session, actor: str = "Orchestrator") 
     """
     alerts_by_id = {a.id: a for a in db.query(AlertModel).all()}
     marked: List[str] = []
-    for inc in db.query(IncidentModel).filter(IncidentModel.status != "MERGED").order_by(IncidentModel.id).all():
+    for inc in db.query(IncidentModel).filter(active_incidents_clause()).order_by(IncidentModel.id).all():
         details = inc.details or {}
         if not details.get("investigation") or details.get("investigation_stale"):
             continue
