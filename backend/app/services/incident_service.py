@@ -1,5 +1,4 @@
 """Persistence logic that turns correlation groups into incident records."""
-import copy
 from datetime import datetime
 from typing import Any, Dict, List
 
@@ -10,19 +9,11 @@ from app.agents.correlation.correlation_agent import CorrelationAgent, SEVERITY_
 from app.models.models import AlertModel, IncidentModel
 from app.services.audit import log_action
 from app.services.pipeline_steps import alert_dict
+from app.services.staleness import analysis_basis, details_copy as _details, now_iso as _now_iso, void_decision
 
 # Alert statuses an incident step may move forward from (never CLOSED, never backwards)
 CORRELATE_FROM = ("NEW", "TRIAGED", "ENRICHED")
 INVESTIGATE_FROM = ("NEW", "TRIAGED", "ENRICHED", "CORRELATED")
-
-
-def _now_iso() -> str:
-    return datetime.utcnow().isoformat() + "Z"
-
-
-def _details(incident: IncidentModel) -> Dict[str, Any]:
-    """Deep copy of incident.details, so nested edits are always detected as a change when saved."""
-    return copy.deepcopy(incident.details or {})
 
 
 def next_incident_id(db: Session) -> str:
@@ -107,17 +98,10 @@ def _correlate_once(db: Session, window_hours: int) -> Dict[str, Any]:
             target.title = _incident_title(group)
             target_details = _details(target)
             target_details.update({"correlation": correlation_info, "investigation_stale": True, "recommendations_stale": True})
-            if target.human_approval_status != "PENDING":
-                # The old decision no longer applies; keep it as history rather than showing it as current
-                target_details.setdefault("review_history", []).append(
-                    {"review": target_details.pop("review", None), "simulation": target_details.pop("simulation", None),
-                     "superseded_at": _now_iso()})
             target.details = target_details
             if target.human_approval_status != "PENDING":
-                log_action(db, agent.agent_name, "APPROVAL_RESET", target.id,
-                           {"reason": "new correlated alerts changed the incident after a decision", "previous": target.human_approval_status})
-                target.human_approval_status = "PENDING"
-                target.status = "OPEN"
+                # The old decision no longer applies: it is kept as history and a new review is required
+                void_decision(db, target, agent.agent_name, "new correlated alerts changed the incident after a decision")
             log_action(db, agent.agent_name, "INCIDENT_UPDATED", target.id, {"alert_ids": merged_ids})
             updated.append(target.id)
         for aid in target.correlated_alert_ids:
@@ -153,6 +137,7 @@ def investigate_incident(db: Session, incident: IncidentModel) -> Dict[str, Any]
     result["log_source"] = {"type": "synthetic_sample_file", "path": LOG_SOURCE_PATH, "records_available": len(logs),
                             "note": "Logs come from a bundled synthetic sample file; no SIEM or log platform was queried."}
     details["investigation"] = result
+    details["analysis_basis"] = analysis_basis(alerts)     # the evidence this analysis was built from
     details["investigation_stale"] = False
     details["recommendations_stale"] = True
     incident.details = details
@@ -189,6 +174,7 @@ def recommend_for_incident(db: Session, incident: IncidentModel) -> Dict[str, An
     details["recommendations"] = result["recommendations"]
     details["response"] = {k: result[k] for k in ("evidence_strength", "requires_human_approval", "execution_mode", "max_impact", "note", "context")}
     details["recommendations_stale"] = False
+    details["stale_reasons"] = []   # the analysis now reflects the latest stored evidence
     incident.details = details
     incident.recommended_action = result["primary_action"]
     incident.status = "RESPONSE_PROPOSED"

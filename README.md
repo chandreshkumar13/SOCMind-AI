@@ -14,7 +14,7 @@ executed against a real system.
 | Alert ingestion, normalization, storage (FastAPI + SQLAlchemy + SQLite), duplicate detection | **Real** |
 | Deterministic triage scoring with an explanation | **Real** (rule based) |
 | IOC extraction (IPv4/IPv6, hashes, URLs, domains) | **Real** |
-| Threat-intelligence **lookups** | **Simulated**: a small local mock dataset. Results are labelled `mock` and `verified: false`. No live provider (VirusTotal, AbuseIPDB, ...) is implemented. |
+| Threat-intelligence **lookups** | **Simulated by default**: a small local mock dataset, labelled `mock` and `verified: false`. **Optional live mode** (`THREAT_INTEL_PROVIDER=virustotal` plus your own API key) looks public IPs, domains and file hashes up on VirusTotal's public API. Live results are third-party verdicts and are never presented as verified. See "Threat intelligence". |
 | Correlation into incidents | **Real** (shared host / IP / hash within a time window) |
 | Investigation timeline and findings | **Real logic on synthetic logs**: logs come from `data/sample_logs/sample_logs.json`; no SIEM is queried. Hypotheses are keyword rules, labelled as unconfirmed. |
 | Response recommendations | **Real logic**, proposals only |
@@ -43,7 +43,7 @@ backend/app/
   api/v1/        routers: alerts, incidents, pipeline + agents, audit-logs, stats/config, health
   agents/        triage, enrichment, correlation, investigation, response
   services/      orchestrator, incident_service, pipeline_steps, normalization, audit, seed, log_store
-  tools/         mock_intel.py   (local mock threat intelligence)
+  tools/         mock_intel.py (offline mock intelligence), virustotal.py (opt-in VirusTotal client)
   models/        SQLAlchemy models        schemas/   Pydantic request/response models
   db/session.py  engine, sessions, and the small startup schema upgrade
 backend/tests/   pytest suite (178 tests)
@@ -106,13 +106,54 @@ image runs the Vite dev server). It was **not** run during the latest verificati
 ## Configuration
 
 Copy [`.env.example`](.env.example) to `backend/.env`. Every variable is optional. Only variables the code reads are listed:
-`PROJECT_NAME`, `ENVIRONMENT`, `DEBUG`, `LOG_LEVEL`, `DATABASE_URL`, `CORS_ORIGINS`, `THREAT_INTEL_MOCK_MODE`.
-Never commit a real `.env` (it is in `.gitignore`).
+`PROJECT_NAME`, `ENVIRONMENT`, `DEBUG`, `LOG_LEVEL`, `DATABASE_URL`, `CORS_ORIGINS`, `THREAT_INTEL_MOCK_MODE`,
+`THREAT_INTEL_PROVIDER` and the `VIRUSTOTAL_*` settings described below. Never commit a real `.env` (it is in `.gitignore`).
 
-| `THREAT_INTEL_MOCK_MODE` | Behaviour |
-| --- | --- |
-| `true` (default) | IOCs are looked up in the local **mock** dataset. Reputation `CLEAN` / `UNKNOWN` only means "the mock has no malicious record", **never "safe"**. |
-| `false` | IOCs are extracted but **not looked up**. Every reputation is `UNKNOWN` with `lookup_performed: false` ("not checked"). |
+### Threat intelligence
+
+Reputation lookups run in one of three modes. **The default is the offline mock; nothing leaves your machine unless you opt in.**
+
+| Setting | Mode | Behaviour |
+| --- | --- | --- |
+| `THREAT_INTEL_PROVIDER=mock` (default) | `mock` | IOCs are looked up in the built-in **mock** dataset. Reputation `CLEAN` / `UNKNOWN` only means "the mock has no malicious record", **never "safe"**. |
+| `THREAT_INTEL_PROVIDER=virustotal` **and** `VIRUSTOTAL_API_KEY` set | `live` | Public IPs, domains and file hashes are looked up on VirusTotal. |
+| `THREAT_INTEL_PROVIDER=virustotal`, **no key** | `mock` (fallback) | Falls back to the mock **and says so**: the enrichment result carries `fallback_reason`, and Settings / `GET /config` show requested vs. active provider. |
+| `THREAT_INTEL_MOCK_MODE=false` | `unavailable` | Overrides everything: IOCs are extracted but **not looked up**; every reputation is `UNKNOWN` ("not checked"). |
+
+**Enabling VirusTotal.** Create a free account at virustotal.com, copy your API key, then put it in `backend/.env`
+(never in the frontend, never in Git):
+
+```
+THREAT_INTEL_PROVIDER=virustotal
+VIRUSTOTAL_API_KEY=<your key>
+```
+
+Restart the backend. Settings → *Analysis Configuration* shows the active provider, whether a key is configured (yes/no
+only; the key is never returned or displayed) and the quota used.
+
+**What is sent, and what is not.** Only the indicator value goes to `www.virustotal.com`, as a read-only lookup. Private,
+loopback, link-local, reserved and other non-public IP addresses are **never** sent; neither are URLs (lookups are off
+in this version), invalid or internal-looking domains (`.local`, `.internal`, file names such as `install.sh`), or
+values that are not valid indicators. Indicators you do send are visible to VirusTotal: do not enable live mode for
+data you may not disclose.
+
+**Quota, honestly.** The public API allows **4 requests per minute and 500 per day** and may only be used for
+**non-commercial** purposes (VirusTotal's terms). SOCMind AI never waits for quota inside a request. It spends at most
+`VIRUSTOTAL_MAX_LOOKUPS_PER_ALERT` (default 5) requests per alert, answers repeats from an in-memory cache (24 h,
+lost on restart), and stops sending while VirusTotal answers 429 or fails repeatedly. Indicators that could not be
+checked are reported as `UNKNOWN` with a `lookup_status` such as `rate_limited`, the alert's enrichment is marked
+`incomplete`, and the pipeline run is reported as **partial** with a warning. **Run the pipeline again a minute or
+more later** and only the missing indicators are looked up. On the 10 sample alerts, 7 eligible indicators need at least
+two minutes of quota.
+
+**Reading live results.** `MALICIOUS` means at least `VIRUSTOTAL_MALICIOUS_THRESHOLD` (default 3) engines flagged it;
+fewer flags (or any "suspicious") give `SUSPICIOUS`; zero flags give `CLEAN` with the note that this is not proof of
+safety; "not found" gives `UNKNOWN`. Findings are attributed to VirusTotal, are never called "verified", and link to
+the VirusTotal report. Detections can be false positives: the response agent still only **proposes** actions and a human
+must approve them, and even an approved action is only simulated.
+
+The sample alerts use real public addresses and well-known hashes, so live verdicts on them are not meaningful; use live
+mode with real alert data, or treat the sample data as a demo of the workflow only.
 
 ## Database
 
@@ -171,7 +212,7 @@ layout and styling are unverified); Docker; PostgreSQL; and no linter or type ch
 - **No authentication or authorization.** Anyone who can reach the API can approve, reject, simulate or run the pipeline.
   Reviewer names are self-asserted free text. Run it only on a trusted local network and do not expose it publicly.
 - Adding authentication was deliberately left out of scope; the approval workflow would need real identities first.
-- Threat intelligence is mock data; investigation logs are a bundled sample file. Do not rely on its verdicts.
+- Threat intelligence is mock data unless you enable VirusTotal; live verdicts are third-party opinions and can be wrong. Investigation logs are a bundled sample file.
 - There is no real response integration; "simulated" means a record was written, nothing else.
 - `CORS_ORIGINS` allows credentials; keep the list to origins you control.
 - The pipeline run lock is per process (several server workers would not share it).

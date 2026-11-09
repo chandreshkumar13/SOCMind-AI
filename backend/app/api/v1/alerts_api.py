@@ -123,6 +123,7 @@ def list_alerts(
         search_term = f"%{search}%"
         query = query.filter(
             or_(
+                AlertModel.id.ilike(search_term),
                 AlertModel.alert_title.ilike(search_term),
                 AlertModel.description.ilike(search_term),
                 AlertModel.host.ilike(search_term),

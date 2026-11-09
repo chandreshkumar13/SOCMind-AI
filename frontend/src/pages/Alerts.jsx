@@ -1,8 +1,23 @@
-import React, { useState } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import { Filter, Search, PlusCircle, RefreshCw, AlertTriangle } from 'lucide-react';
 import StatusBadge from '../components/StatusBadge';
 import { api } from '../api';
-import { reputationKey, truncationNote } from '../lib/view';
+import { alertSearchPath, detectionLabel, enrichmentNotices, fetchAlertSearch, formatUtc, intelSource, isRetryableLookup, lookupStatusLabel, refreshedSelection, reputationKey, reputationSource, safeVirusTotalUrl, searchCapNote, truncationNote } from '../lib/view';
+
+// Where the reputations came from, as stored on the record. Live results are blue and name their provider;
+// everything else keeps the amber "unverified" tint.
+function SourceTag({ source }) {
+  const colours = source.live
+    ? { color: '#4facfe', border: '1px solid #4facfe' }
+    : source.kind === 'mock'
+      ? { color: '#fde047', border: '1px solid rgba(234, 179, 8, 0.6)' }
+      : { color: 'var(--text-muted)', border: '1px solid var(--border-color)' };
+  return (
+    <span style={{ ...colours, fontSize: '11px', fontWeight: 700, padding: '2px 8px', borderRadius: '9999px' }}>
+      {source.label}
+    </span>
+  );
+}
 
 // Triage and enrichment results stored on the alert (normalized_data.triage / .enrichment)
 export function AnalysisPanels({ alert, busy, onRun, runError }) {
@@ -11,6 +26,7 @@ export function AnalysisPanels({ alert, busy, onRun, runError }) {
   const enr = data.enrichment;
   const closed = alert.status === 'CLOSED';
   const small = { fontSize: '11px', color: 'var(--text-muted)' };
+  const source = intelSource(enr);
   const btn = { padding: '4px 10px', borderRadius: 'var(--radius-sm)', border: '1px solid var(--border-color)', background: 'rgba(255,255,255,0.05)', color: 'var(--accent-cyan)', fontSize: '12px', cursor: busy ? 'wait' : 'pointer' };
   return (
     <div style={{ marginTop: '12px', paddingTop: '12px', borderTop: '1px solid var(--border-color)', display: 'flex', flexDirection: 'column', gap: '12px' }}>
@@ -41,16 +57,42 @@ export function AnalysisPanels({ alert, busy, onRun, runError }) {
         {enr && (
           <div style={{ fontSize: '12px', marginTop: '4px' }}>
             {enr.total_iocs_extracted} IOC(s): {enr.summary.malicious} malicious · {enr.summary.suspicious} suspicious · {enr.summary.clean} clean · {enr.summary.unknown} unknown
-            {enr.disclaimer && <div style={{ ...small, color: '#fde047', marginTop: '4px' }}>{enr.disclaimer}</div>}
+            {enr.timestamp && <div style={{ ...small, marginTop: '4px' }}>Recorded {formatUtc(enr.timestamp)}</div>}
+            {source && (
+              <div style={{ display: 'flex', alignItems: 'center', gap: '8px', flexWrap: 'wrap', marginTop: '6px' }}>
+                <SourceTag source={source} />
+                <span style={small}>
+                  {source.live ? 'third-party verdicts · not independently verified' : source.kind === 'mock' ? 'offline sample data · not verified' : ''}
+                </span>
+              </div>
+            )}
+            {source && <div style={{ ...small, color: '#fde047', marginTop: '4px' }}>{source.disclaimer}</div>}
+            {enrichmentNotices(enr).map((note, k) => <div key={k} style={{ ...small, color: '#fb923c', marginTop: '4px' }}>{note}</div>)}
             {enr.iocs.length > 0 && (
               <table className="cyber-table" style={{ marginTop: '6px' }}>
-                <thead><tr><th>Type</th><th>Value</th><th>Reputation (mock)</th><th>Evidence</th></tr></thead>
+                <thead>
+                  <tr>
+                    <th>Type</th><th>Value</th><th>Reputation ({reputationSource(enr)})</th>
+                    {source && source.live && <th>Lookup</th>}
+                    <th>Evidence</th>
+                  </tr>
+                </thead>
                 <tbody>
                   {enr.iocs.map((i, k) => (
                     <tr key={k}>
                       <td className="code-font">{i.type}</td>
                       <td className="code-font" style={{ wordBreak: 'break-all', fontSize: '10px' }}>{i.value}</td>
                       <td><StatusBadge severity={reputationKey(i.reputation)} label={i.reputation} /></td>
+                      {source && source.live && (
+                        <td style={{ ...small, color: isRetryableLookup(i.lookup_status) ? '#fb923c' : 'var(--text-muted)' }}>
+                          {lookupStatusLabel(i.lookup_status)}
+                          {detectionLabel(i.detections) && <div>{detectionLabel(i.detections)}</div>}
+                          {i.cached && <div>from cache</div>}
+                          {safeVirusTotalUrl(i.reference_url) && (
+                            <a href={safeVirusTotalUrl(i.reference_url)} target="_blank" rel="noopener noreferrer" style={{ color: 'var(--accent-cyan)' }}>VirusTotal report</a>
+                          )}
+                        </td>
+                      )}
                       <td style={small}>{i.evidence}</td>
                     </tr>
                   ))}
@@ -65,6 +107,20 @@ export function AnalysisPanels({ alert, busy, onRun, runError }) {
   );
 }
 
+// Search over the fields an analyst is likely to type: title, source, host, user, alert ID and IP addresses.
+// Case-insensitive, ignores surrounding spaces, and an empty query matches every alert.
+export function alertMatchesSearch(alert, searchQuery) {
+  const query = searchQuery.trim().toLowerCase();
+  const fields = [
+    alert.alert_title || alert.alert_name, alert.source || alert.source_system, alert.host || alert.host_name,
+    alert.username || alert.user, alert.id, alert.source_ip, alert.destination_ip,
+  ];
+  return fields.some((field) => String(field || '').toLowerCase().includes(query));
+}
+
+// Pause after the last keystroke before asking the server, so typing does not send a request per character.
+const SEARCH_DEBOUNCE_MS = 250;
+
 export default function Alerts({ alerts, loading, error, refreshAlerts, seedSampleAlerts, totalAlerts }) {
   const [analysisBusy, setAnalysisBusy] = useState(false);
   const [analysisError, setAnalysisError] = useState(null);
@@ -73,19 +129,50 @@ export default function Alerts({ alerts, loading, error, refreshAlerts, seedSamp
   const [selectedAlert, setSelectedAlert] = useState(null);
   const [fetchingDetail, setFetchingDetail] = useState(false);
   const [ingesting, setIngesting] = useState(false);
+  const [searchResult, setSearchResult] = useState(null);   // { term, rows } from GET /alerts?search=
+  const [searching, setSearching] = useState(false);
+  const [searchError, setSearchError] = useState(null);
+  const searchSequence = useRef(0);   // a response from an older search run is ignored
 
-  // Client-side filtering
-  const filteredAlerts = alerts.filter(a => {
+  // The drawer holds its own copy of the alert. Keep it in step with the list the page loads, so a result stored
+  // elsewhere (another tool, the pipeline, a re-run) replaces the older snapshot instead of being hidden by it.
+  useEffect(() => {
+    setSelectedAlert(prev => (prev ? refreshedSelection(prev, alerts) : prev));
+  }, [alerts]);
+
+  // Server-side search over every alert, not only the loaded first page. It waits briefly after typing, and it runs
+  // again whenever the list reloads (ingest, triage, enrichment, refresh), so matches never show an older state.
+  useEffect(() => {
+    const sequence = ++searchSequence.current;
+    const path = alertSearchPath(searchQuery);
+    setSearchError(null);
+    if (!path) {
+      setSearchResult(null);
+      setSearching(false);
+      return undefined;
+    }
+    setSearching(true);
+    const timer = setTimeout(async () => {
+      const next = await fetchAlertSearch(searchQuery, api);
+      if (sequence !== searchSequence.current) return;   // a newer search has started, or the page has unmounted
+      setSearchResult(next.result);   // null after a failure, so the page falls back to the loaded alerts
+      setSearchError(next.error);
+      setSearching(false);
+    }, SEARCH_DEBOUNCE_MS);
+    return () => clearTimeout(timer);
+  }, [searchQuery, alerts]);
+
+  useEffect(() => () => { searchSequence.current += 1; }, []);
+
+  // Client-side severity filter. While a search is active, the server's matches replace the loaded list. Until they
+  // arrive, or if the search fails, the loaded list is filtered locally so the table never goes blank.
+  const searchActive = alertSearchPath(searchQuery) !== null;
+  const serverMatches = searchActive && searchResult && searchResult.term === searchQuery.trim() ? searchResult.rows : null;
+  const capNote = serverMatches ? searchCapNote(serverMatches.length) : '';
+  const filteredAlerts = (serverMatches || alerts).filter(a => {
     const sev = (a.severity || a.raw_severity || '').toUpperCase();
     const matchesSev = filterSeverity === 'ALL' || sev === filterSeverity;
-    const title = (a.alert_title || a.alert_name || '').toLowerCase();
-    const source = (a.source || a.source_system || '').toLowerCase();
-    const host = (a.host || a.host_name || '').toLowerCase();
-    const user = (a.username || a.user || '').toLowerCase();
-    const query = searchQuery.toLowerCase();
-
-    const matchesSearch = title.includes(query) || source.includes(query) || host.includes(query) || user.includes(query);
-    return matchesSev && matchesSearch;
+    return matchesSev && (serverMatches !== null || alertMatchesSearch(a, searchQuery));
   });
 
   // Handle clicking row to inspect single alert details via GET /api/v1/alerts/{id}
@@ -261,9 +348,17 @@ export default function Alerts({ alerts, loading, error, refreshAlerts, seedSamp
         </div>
       )}
 
-      {!loading && truncationNote(alerts.length, totalAlerts) && (
+      {!loading && !searchActive && truncationNote(alerts.length, totalAlerts) && (
         <div style={{ fontSize: '12px', color: '#fde047', marginBottom: '10px' }}>
           {truncationNote(alerts.length, totalAlerts)} Filters apply to the loaded alerts only.
+        </div>
+      )}
+
+      {!loading && searchActive && (searchError || searching || capNote) && (
+        <div style={{ fontSize: '12px', color: searchError ? '#f87171' : '#fde047', marginBottom: '10px' }}>
+          {searchError
+            ? `Search failed: ${searchError}. Showing matches from the loaded alerts only.`
+            : searching ? 'Searching all alerts...' : capNote}
         </div>
       )}
 
@@ -425,6 +520,16 @@ export default function Alerts({ alerts, loading, error, refreshAlerts, seedSamp
                     <strong style={{ color: 'var(--accent-cyan)' }}>Database Metadata:</strong>
                     <div style={{ fontSize: '11px', color: 'var(--text-muted)', marginTop: '4px' }}>
                       Status: <strong>{selectedAlert.status || 'NEW'}</strong> | Ext ID: <code>{selectedAlert.external_alert_id || selectedAlert.id}</code>
+                    </div>
+                    <div style={{ fontSize: '11px', color: 'var(--text-muted)', marginTop: '4px', display: 'flex', gap: '10px', alignItems: 'center', flexWrap: 'wrap' }}>
+                      Record updated {formatUtc(selectedAlert.updated_at)}
+                      <button
+                        onClick={() => handleInspectAlert(selectedAlert.id)}
+                        disabled={fetchingDetail}
+                        style={{ padding: '2px 8px', borderRadius: 'var(--radius-sm)', border: '1px solid var(--border-color)', background: 'transparent', color: 'var(--accent-cyan)', fontSize: '11px', cursor: fetchingDetail ? 'wait' : 'pointer' }}
+                      >
+                        Reload from server
+                      </button>
                     </div>
                   </div>
 

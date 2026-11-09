@@ -23,7 +23,7 @@ Base URL: `http://localhost:8000/api/v1`. Interactive documentation generated fr
 | DELETE | `/alerts/{id}` | Close an alert (status `CLOSED`; the record is kept) |
 | POST | `/alerts/seed` | Load the 10 synthetic sample alerts (idempotent) |
 | POST | `/alerts/{id}/triage` | Run deterministic triage on one alert |
-| POST | `/alerts/{id}/enrich` | Extract IOCs and run (mock) enrichment on one alert |
+| POST | `/alerts/{id}/enrich` | Extract IOCs and look them up (local mock by default, VirusTotal when enabled) |
 | POST | `/incidents/correlate` | Group related open alerts into incidents. Body: `{"window_hours": 1-168}` (default 24) |
 | GET | `/incidents` | List incidents. Query: `severity`, `status`, `approval`, `limit` (1-100, default 50), `offset` |
 | GET | `/incidents/{id}` | One incident with its alerts, investigation, recommendations, review and simulation |
@@ -84,8 +84,42 @@ Returns `201` with the stored alert. The timestamp above is stored and returned 
 ```
 
 IOC `type` is `IP`, `SHA256`, `SHA1`, `MD5`, `DOMAIN` or `URL`; `reputation` is `MALICIOUS`, `SUSPICIOUS`, `CLEAN` or
-`UNKNOWN`. **`CLEAN` / `UNKNOWN` never mean verified safe.** With `THREAT_INTEL_MOCK_MODE=false`, `intel_mode` is
-`"unavailable"`, `lookup_performed` is `false` and every reputation is `UNKNOWN` ("not checked").
+`UNKNOWN`. **`CLEAN` / `UNKNOWN` never mean verified safe.**
+
+`intel_mode` says where the reputations came from:
+
+- `"mock"` (default): the local sample dataset. If `THREAT_INTEL_PROVIDER=virustotal` was set without an API key, the
+  result is still `"mock"` and also carries `requested_provider` and `fallback_reason`.
+- `"unavailable"` (`THREAT_INTEL_MOCK_MODE=false`): `lookup_performed` is `false` and every reputation is `UNKNOWN`
+  ("not checked").
+- `"live"` (`THREAT_INTEL_PROVIDER=virustotal` with a key): VirusTotal verdicts. Additional keys, all optional for
+  clients: `provider`, `incomplete`, `lookup_performed`, `lookup_summary`
+  (`requests_made`, `completed`, `from_cache`, `skipped_ineligible`, `not_looked_up_retryable`, `rate_limited`,
+  `per_alert_limit_reached`, `failed`, `auth_error`) and, per IOC, `lookup_status`, `detections`
+  (`malicious`, `suspicious`, `harmless`, `undetected`, `total`), `detected_by`, `retrieved_at`, `reference_url`, `cached`.
+
+```json
+{
+  "intel_mode": "live", "provider": "VirusTotal", "verified": false, "incomplete": true,
+  "lookup_summary": {"requests_made": 4, "completed": 4, "from_cache": 0, "skipped_ineligible": 3, "not_looked_up_retryable": 2,
+                     "rate_limited": 2, "per_alert_limit_reached": 0, "failed": 0, "auth_error": 0},
+  "iocs": [
+    {"value": "185.220.101.5", "type": "IP", "source": "destination_ip", "reputation": "MALICIOUS", "confidence": 0.17,
+     "provider": "VirusTotal", "lookup_status": "completed", "cached": false,
+     "evidence": "12 of 70 engines flagged it as malicious (VirusTotal, analysed 2026-10-24).",
+     "detections": {"malicious": 12, "suspicious": 0, "harmless": 50, "undetected": 8, "total": 70}, "detected_by": ["EngineA"],
+     "retrieved_at": "2026-10-26T09:00:00Z", "reference_url": "https://www.virustotal.com/gui/ip-address/185.220.101.5"},
+    {"value": "10.0.0.5", "type": "IP", "reputation": "UNKNOWN", "provider": "none", "lookup_status": "skipped_non_public_ip"},
+    {"value": "8.8.8.8", "type": "IP", "reputation": "UNKNOWN", "provider": "none", "lookup_status": "rate_limited"}
+  ]
+}
+```
+
+`lookup_status` is one of `completed`, `not_found`, `rate_limited`, `budget_exceeded`, `timeout`, `error`, `circuit_open`,
+`auth_error`, `skipped_non_public_ip`, `skipped_invalid`, `skipped_url`, `skipped_unsupported`. `rate_limited`,
+`budget_exceeded`, `timeout`, `error` and `circuit_open` are **retryable** (they set `incomplete: true`): enrich again
+later to finish them. The others are final for that indicator. A quota or provider problem is not an HTTP error: the response is still `200`. A reputation of `UNKNOWN` with a
+`skipped_*` or retryable status means "not checked", never "safe".
 
 Both steps leave a `CLOSED` alert closed. If the agent fails, the response is `502`, the alert is **not modified**, and
 an `AGENT_FAILED` audit entry is written. A missing alert returns `404`.
@@ -108,11 +142,13 @@ An incident (`GET /incidents/{id}`) has:
 | `human_approval_status` | `PENDING`, `APPROVED`, `REJECTED` |
 | `alerts` | The full correlated alert records |
 | `details.correlation` | Why the alerts were grouped (`reasons`, `shared_entities`, `confidence`, `first_seen`, `last_seen`, `window_hours`) |
-| `details.investigation` | `summary`, `evidence_strength`, `timeline`, `findings` (`verified` / `mock_intel` / `hypothesis`), `entities`, `limitations`, `log_source` |
+| `details.investigation` | `summary`, `evidence_strength`, `timeline`, `findings` (`verified` / `mock_intel` / `external_intel` / `hypothesis`; `external_intel` is a live VirusTotal verdict, attributed and unverified), `entities`, `limitations`, `log_source` |
 | `details.recommendations` | The proposed actions (fields below) |
 | `details.review` / `details.simulation` | The current decision and simulation, when present |
-| `details.review_history` | Earlier decisions voided by new alerts |
-| `details.investigation_stale`, `details.recommendations_stale` | `true` when new alerts changed the incident after that step ran |
+| `details.review_history` | Earlier decisions withdrawn because the evidence changed (each with `superseded_by`) |
+| `details.investigation_stale`, `details.recommendations_stale` | `true` when new correlated alerts, or a material change to an alert's threat-intelligence result, came after that step ran |
+| `details.stale_reasons` | Why the analysis is out of date: `[{alert_id, change, at}]`, newest last (at most 20; `alert_id` is `null` for changes not tied to one alert). Cleared when recommendations are regenerated |
+| `details.analysis_basis` | Digest of each alert's enrichment that the investigation was built from. Compared with the current data before each pipeline run |
 
 A recommendation has: `id`, `category`, `priority`, `action`, `target`, `justification`, `supporting_evidence`,
 `related_techniques`, `expected_benefit`, `impact`, `operational_impact`, `risk_if_wrong`, `reversible`, `rollback`,
@@ -162,6 +198,9 @@ Response (abridged):
 }
 ```
 
+- `alerts_with_incomplete_enrichment`: how many alerts still have retryable live lookups. When it is above zero the
+  Enrichment stage is `partial`, a warning explains why, and the run's `outcome` is `partial`; running the pipeline again
+  later completes the missing lookups.
 - `outcome`: `success`, `partial` (some stage failed or partly failed; `status` is `completed_with_errors`) or
   `failure` (every stage that tried to work failed; `status` is `failed`). The HTTP status is still 200.
 - A stage `status` is `success`, `partial` or `failed`. `items` lists up to 50 ids the stage handled; `processed` is the
@@ -173,7 +212,9 @@ Response (abridged):
 
 - `GET /stats` → `{"alerts": {"total", "by_severity", "by_status"}, "incidents": {"total", "by_status", "by_severity", "awaiting_human_review"}, "audit_entries"}`.
 - `GET /config` → version, environment, `database_engine`, `execution_mode` (`simulation_only`), `threat_intel`
-  (`mode`: `mock` / `unavailable`, `live_provider_implemented: false`), `llm` (`used_by_agents: false`),
+  (`mode`: `mock` / `live` / `unavailable`, `requested_provider`, `active_provider`, `fallback_reason`,
+  `live_provider_implemented: true`, `live_provider_active`, and a `virustotal` object with `api_key_configured`
+  (yes/no only), the limits, `url_lookups: "disabled"` and the rolling `quota` when live mode is active), `llm` (`used_by_agents: false`),
   `authentication` (`enabled: false`), the log source and sample-data paths. It contains no secrets.
 - `GET /audit-logs` → `[{"id", "timestamp", "actor", "action", "target_id", "details"}]`, newest first; `action`
   filters are upper-cased.

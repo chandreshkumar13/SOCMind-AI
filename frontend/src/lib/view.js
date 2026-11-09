@@ -16,9 +16,9 @@ export function describeError(status, body) {
   return `Request failed (HTTP ${status})`;
 }
 
-/** Splits investigation findings into the three evidence classes the UI must never mix up. */
+/** Splits investigation findings into the evidence classes the UI must never mix up. */
 export function groupFindings(findings) {
-  const groups = { verified: [], mock_intel: [], hypothesis: [] };
+  const groups = { verified: [], mock_intel: [], external_intel: [], hypothesis: [] };
   for (const f of findings || []) {
     if (groups[f.type]) groups[f.type].push(f);
   }
@@ -116,4 +116,155 @@ export function previewDetails(details, max = 90) {
 /** "Showing 100 of 130" style note when a list is shorter than the true total. */
 export function truncationNote(shown, total) {
   return typeof total === 'number' && total > shown ? `Showing the first ${shown} of ${total}.` : '';
+}
+
+// The server returns at most this many alerts per request (GET /api/v1/alerts caps limit at 100).
+export const SEARCH_RESULT_LIMIT = 100;
+
+/** Request path for a server-side alert search, or null for an empty query. The query is trimmed and URL-encoded. */
+export function alertSearchPath(query, limit = SEARCH_RESULT_LIMIT) {
+  const term = String(query ?? '').trim();
+  if (!term) return null;
+  return `/alerts?search=${encodeURIComponent(term)}&limit=${limit}`;
+}
+
+/** Note for a search that filled the whole page: there may be more matches than are shown. */
+export function searchCapNote(count, limit = SEARCH_RESULT_LIMIT) {
+  return count >= limit
+    ? `Showing the first ${limit} matches. Results are capped at ${limit}, so refine the search to narrow them.`
+    : '';
+}
+
+/**
+ * The outcome of one server-side alert search, as the page should hold it: the rows for the query, or an error.
+ * A failed request carries no rows at all, so rows from an earlier search for the same query are never shown as
+ * current matches; the page then falls back to the loaded alerts.
+ */
+export async function fetchAlertSearch(query, request) {
+  const path = alertSearchPath(query);
+  if (!path) return { result: null, error: null };
+  try {
+    const rows = await request(path);
+    return { result: { term: String(query).trim(), rows }, error: null };
+  } catch (err) {
+    return { result: null, error: err?.message || 'request failed' };
+  }
+}
+
+// ---- threat-intelligence presentation ---------------------------------------------------------------------------
+const RETRYABLE_LOOKUPS = ['rate_limited', 'budget_exceeded', 'timeout', 'error', 'circuit_open'];
+
+const LOOKUP_LABELS = {
+  completed: 'Looked up',
+  not_found: 'Not found (not evidence of safety)',
+  rate_limited: 'Quota reached, retry later',
+  budget_exceeded: 'Per-alert limit, retry later',
+  timeout: 'Timed out, retry later',
+  error: 'Failed, retry later',
+  circuit_open: 'Paused after failures, retry later',
+  auth_error: 'API key rejected',
+  skipped_non_public_ip: 'Private or reserved: not sent',
+  skipped_invalid: 'Not a public indicator: not sent',
+  skipped_url: 'URL lookups are off',
+  skipped_unsupported: 'Not looked up',
+};
+
+const MOCK_DISCLAIMER_TEXT = 'Results come from LOCAL MOCK threat intelligence, not a verified live feed. A CLEAN or UNKNOWN reputation only means the mock has no malicious record; it does not mean the indicator is verified safe.';
+const UNAVAILABLE_DISCLAIMER_TEXT = 'No threat-intelligence lookups were performed, so every reputation means "not checked", not "safe".';
+
+/**
+ * Where an enrichment result's reputations really came from. A result is labelled LIVE only when the stored record
+ * says intel_mode "live" AND names its provider. Anything less is never presented as live:
+ *  - intel_mode "live" without a provider is "unrecorded";
+ *  - a record with no intel_mode is the local mock (the only source before live mode existed), unless it names a provider.
+ */
+export function intelSource(enrichment) {
+  if (!enrichment || typeof enrichment !== 'object') return null;
+  const mode = enrichment.intel_mode;
+  const provider = typeof enrichment.provider === 'string' ? enrichment.provider.trim() : '';
+  if (mode === 'live') {
+    if (provider) {
+      return {
+        kind: 'live', live: true, label: `${provider} (live lookup)`, columnLabel: provider, verified: false,
+        disclaimer: enrichment.disclaimer || `Reputation reported by ${provider}. It is not independently verified by SOCMind AI and can include false positives. CLEAN, UNKNOWN or 'not found' never mean the indicator is verified safe.`,
+      };
+    }
+    return {
+      kind: 'unrecorded', live: false, label: 'Live lookup, provider not recorded', columnLabel: 'unrecorded', verified: false,
+      disclaimer: 'The stored record says it used live lookups but does not name the provider, so it is treated as unverified.',
+    };
+  }
+  if (mode === 'unavailable') {
+    return {
+      kind: 'unavailable', live: false, label: 'Not looked up', columnLabel: 'not looked up', verified: false,
+      disclaimer: enrichment.disclaimer || UNAVAILABLE_DISCLAIMER_TEXT,
+    };
+  }
+  if (mode === 'mock' || (!mode && !provider)) {
+    return {
+      kind: 'mock', live: false, label: 'Local mock (unverified)', columnLabel: 'mock', verified: false,
+      disclaimer: enrichment.disclaimer || MOCK_DISCLAIMER_TEXT,
+    };
+  }
+  return {
+    kind: 'unrecorded', live: false, label: 'Source not recorded', columnLabel: 'unrecorded', verified: false,
+    disclaimer: 'The stored record does not say which source produced these reputations, so they are treated as unverified.',
+  };
+}
+
+/** Column title: "mock", "VirusTotal", "not looked up" or "unrecorded". */
+export function reputationSource(enrichment) {
+  const source = intelSource(enrichment);
+  return source ? source.columnLabel : 'mock';
+}
+
+/** Microsecond-precise sort key for the backend's UTC timestamps; -Infinity when missing or unreadable. */
+function timestampKey(value) {
+  const m = /^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})(?:\.(\d+))?/.exec(String(value || ''));
+  if (!m) return -Infinity;
+  const base = Date.parse(`${m[1]}Z`);
+  if (Number.isNaN(base)) return -Infinity;
+  return base * 1000 + Number((m[2] || '').padEnd(6, '0').slice(0, 6));
+}
+
+/**
+ * Keeps an open alert record in step with the server. Returns the copy of the same alert from a freshly loaded list
+ * when that copy is at least as new; otherwise keeps the open record (it may have been fetched after the list).
+ */
+export function refreshedSelection(selected, list) {
+  if (!selected) return null;
+  const fresh = (list || []).find((a) => a && a.id === selected.id);
+  if (!fresh) return selected;
+  return timestampKey(fresh.updated_at) >= timestampKey(selected.updated_at) ? fresh : selected;
+}
+
+
+export function lookupStatusLabel(status) {
+  if (!status) return '';
+  return LOOKUP_LABELS[status] || String(status).replace(/_/g, ' ');
+}
+
+export function isRetryableLookup(status) {
+  return RETRYABLE_LOOKUPS.includes(status);
+}
+
+/** "3/72 engines flagged" from a detections object, or '' when there is none. */
+export function detectionLabel(detections) {
+  if (!detections || !detections.total) return '';
+  return `${(detections.malicious || 0) + (detections.suspicious || 0)}/${detections.total} engines flagged`;
+}
+
+/** Only ever link to VirusTotal's own report pages; anything else coming back from the API is dropped. */
+export function safeVirusTotalUrl(url) {
+  return typeof url === 'string' && /^https:\/\/www\.virustotal\.com\/gui\/[A-Za-z0-9:._/-]+$/.test(url) ? url : null;
+}
+
+/** Plain-language notes about an enrichment result that an analyst must not miss. */
+export function enrichmentNotices(enrichment) {
+  if (!enrichment) return [];
+  const notes = [];
+  if (enrichment.fallback_reason) notes.push(`Live lookups were requested but are not active: ${enrichment.fallback_reason}`);
+  if (enrichment.intel_mode === 'unavailable') notes.push('No lookups were performed, so every reputation is "not checked".');
+  if (enrichment.incomplete) notes.push('Some indicators could not be checked yet (request quota, per-alert limit or provider errors). Run the pipeline or enrichment again later to complete them.');
+  return notes;
 }

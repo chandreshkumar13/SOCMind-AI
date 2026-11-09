@@ -8,6 +8,7 @@ from app.core.config import EXECUTION_MODE, settings
 from app.db.session import get_db
 from app.models.models import AlertModel, AuditLogModel, IncidentModel
 from app.services.log_store import LOG_SOURCE_PATH
+from app.services.threat_intel import api_key_configured, quota_snapshot, resolve_provider
 
 router = APIRouter()
 
@@ -36,16 +37,35 @@ def stats(db: Session = Depends(get_db)) -> Dict[str, Any]:
 @router.get("/config", summary="Runtime Configuration (non-secret)")
 def runtime_config() -> Dict[str, Any]:
     """What this backend is actually configured to do. Contains no secrets, keys or connection strings."""
+    choice = resolve_provider()
     return {
         "version": settings.VERSION,
         "environment": settings.ENVIRONMENT,
         "database_engine": settings.DATABASE_URL.split(":")[0],
         "execution_mode": EXECUTION_MODE,
         "threat_intel": {
-            "mode": "mock" if settings.THREAT_INTEL_MOCK_MODE else "unavailable",
-            "live_provider_implemented": False,
-            "note": ("Reputation lookups use a local mock dataset and are not verified intelligence."
-                     if settings.THREAT_INTEL_MOCK_MODE else "No lookups are performed; IOCs are extracted only."),
+            "mode": {"mock": "mock", "virustotal": "live", "unavailable": "unavailable"}[choice.active],
+            "requested_provider": choice.requested,
+            "active_provider": choice.active,
+            "live_provider_implemented": True,
+            "live_provider_active": choice.active == "virustotal",
+            "fallback_reason": choice.reason,
+            "virustotal": {
+                "api_key_configured": api_key_configured(),   # a yes/no only; the key itself is never returned
+                "malicious_threshold": settings.VIRUSTOTAL_MALICIOUS_THRESHOLD,
+                "max_lookups_per_alert": settings.VIRUSTOTAL_MAX_LOOKUPS_PER_ALERT,
+                "requests_per_minute": settings.VIRUSTOTAL_REQUESTS_PER_MINUTE,
+                "requests_per_day": settings.VIRUSTOTAL_REQUESTS_PER_DAY,
+                "timeout_seconds": settings.VIRUSTOTAL_TIMEOUT_SECONDS,
+                "cache_ttl_seconds": settings.VIRUSTOTAL_CACHE_TTL_SECONDS,
+                "url_lookups": "disabled",
+                "quota": quota_snapshot(),
+            },
+            "note": {
+                "mock": "Reputation lookups use a local mock dataset and are not verified intelligence.",
+                "virustotal": "Indicators are looked up on VirusTotal's public API. Results are third-party verdicts, not verified by SOCMind AI.",
+                "unavailable": "No lookups are performed; IOCs are extracted only.",
+            }[choice.active],
         },
         "llm": {"configured_provider": settings.LLM_PROVIDER, "used_by_agents": False,
                 "note": "All five agents are deterministic rule-based code; no LLM is called."},

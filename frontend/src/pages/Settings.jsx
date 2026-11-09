@@ -42,8 +42,15 @@ export default function Settings() {
               <Sliders size={20} color="var(--accent-cyan)" />
               <h3 style={{ fontSize: '16px' }}>Analysis Configuration</h3>
             </div>
-            <Row name="Threat intelligence" value={cfg.threat_intel.mode === 'mock' ? 'Local mock data' : 'Unavailable (no lookups)'} note={cfg.threat_intel.note} />
-            <Row name="Live threat-intelligence provider" value={cfg.threat_intel.live_provider_implemented ? 'Implemented' : 'Not implemented'} />
+            <Row name="Threat intelligence" value={{ live: 'VirusTotal (live lookups)', mock: 'Local mock data', unavailable: 'Unavailable (no lookups)' }[cfg.threat_intel.mode]} note={cfg.threat_intel.note} />
+            <Row name="Provider requested / active" value={`${cfg.threat_intel.requested_provider} / ${cfg.threat_intel.active_provider}`} note={cfg.threat_intel.fallback_reason || undefined} />
+            <Row name="VirusTotal API key" value={cfg.threat_intel.virustotal.api_key_configured ? 'Configured' : 'Not configured'} note="Only whether a key exists is shown. The key itself is never returned by the API or displayed." />
+            <Row name="VirusTotal limits" value={`${cfg.threat_intel.virustotal.requests_per_minute}/min · ${cfg.threat_intel.virustotal.requests_per_day}/day · ${cfg.threat_intel.virustotal.max_lookups_per_alert} per alert`}
+              note={`MALICIOUS needs ${cfg.threat_intel.virustotal.malicious_threshold}+ detections. Private/reserved addresses and URLs are never sent. Timeout ${cfg.threat_intel.virustotal.timeout_seconds}s.`} />
+            {cfg.threat_intel.virustotal.quota && (
+              <Row name="Quota used (rolling)" value={`${cfg.threat_intel.virustotal.quota.used_last_minute}/${cfg.threat_intel.virustotal.quota.per_minute} last minute · ${cfg.threat_intel.virustotal.quota.used_last_24h}/${cfg.threat_intel.virustotal.quota.per_day} last 24 h`}
+                note={cfg.threat_intel.virustotal.quota.paused_for_seconds ? `Paused for about ${cfg.threat_intel.virustotal.quota.paused_for_seconds} s after a rate-limit answer.` : undefined} />
+            )}
             <Row name="AI model" value={cfg.llm.used_by_agents ? cfg.llm.configured_provider : 'None used'} note={cfg.llm.note} />
           </div>
 

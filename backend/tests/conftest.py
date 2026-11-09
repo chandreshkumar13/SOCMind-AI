@@ -16,6 +16,12 @@ _SESSION_DB_DIR = tempfile.mkdtemp(prefix="socmind-tests-")
 os.environ["DATABASE_URL"] = "sqlite:///" + os.path.join(_SESSION_DB_DIR, "session.db").replace("\\", "/")
 atexit.register(shutil.rmtree, _SESSION_DB_DIR, ignore_errors=True)
 
+# Threat-intelligence lookups stay on the offline mock in tests, whatever a developer has in the shell or in a .env
+# file. An empty key counts as "not configured". Tests that need live behaviour enable it explicitly, with a fake
+# key and a mocked HTTP transport.
+os.environ["THREAT_INTEL_PROVIDER"] = "mock"
+os.environ["VIRUSTOTAL_API_KEY"] = ""
+
 
 def pytest_sessionfinish(session, exitstatus):
     """Release the SQLite file (Windows cannot delete an open file) and remove the throw-away directory."""
@@ -24,6 +30,7 @@ def pytest_sessionfinish(session, exitstatus):
     shutil.rmtree(_SESSION_DB_DIR, ignore_errors=True)
 
 
+import socket  # noqa: E402
 import pytest  # noqa: E402  (must come after DATABASE_URL is set)
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine
@@ -32,6 +39,38 @@ from sqlalchemy.orm import sessionmaker
 from app.main import app
 from app.db.session import get_db
 from app.models.base import Base
+
+
+_LOCAL_HOSTS = {"127.0.0.1", "::1", "localhost", "0.0.0.0", ""}
+_real_connect = socket.socket.connect
+_real_getaddrinfo = socket.getaddrinfo
+
+
+@pytest.fixture(autouse=True)
+def _no_outbound_network(monkeypatch):
+    """No test may reach the internet (a real VirusTotal call would spend quota and leak indicators)."""
+    def guarded_connect(self, address):
+        host = address[0] if isinstance(address, tuple) else None
+        if host is not None and host not in _LOCAL_HOSTS:
+            raise RuntimeError(f"Outbound network access is blocked in tests (tried to connect to {host}).")
+        return _real_connect(self, address)
+
+    def guarded_getaddrinfo(host, *args, **kwargs):
+        if host not in _LOCAL_HOSTS and host is not None:
+            raise RuntimeError(f"Outbound network access is blocked in tests (tried to resolve {host}).")
+        return _real_getaddrinfo(host, *args, **kwargs)
+
+    monkeypatch.setattr(socket.socket, "connect", guarded_connect)
+    monkeypatch.setattr(socket, "getaddrinfo", guarded_getaddrinfo)
+
+
+@pytest.fixture(autouse=True)
+def _fresh_threat_intel_client():
+    """The live client keeps quota counters and a cache; every test starts with none."""
+    from app.services.threat_intel import reset_client
+    reset_client()
+    yield
+    reset_client()
 
 
 @pytest.fixture

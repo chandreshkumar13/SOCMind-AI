@@ -8,12 +8,15 @@ import uvicorn
 from app.core.config import settings
 from app.api.v1.router import api_router
 from app.db.session import init_db
+from app.services.threat_intel import resolve_provider
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # Initialize DB tables on startup
     init_db()
+    choice = resolve_provider()
+    logger.info("Threat intelligence provider: %s%s", choice.active, f" ({choice.reason})" if choice.reason else "")
     yield
 
 # Also ensure DB tables exist upon module import
@@ -41,6 +44,9 @@ app.add_middleware(
 logging.basicConfig(level=getattr(logging, str(settings.LOG_LEVEL).upper(), logging.INFO),
                     format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 logger = logging.getLogger("socmind")
+# httpx logs every request URL at INFO; keep indicator values and provider URLs out of the application log
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
 
 
 # Global Error Handler

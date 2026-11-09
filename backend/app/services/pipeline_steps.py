@@ -9,10 +9,13 @@ from typing import Any, Dict
 from sqlalchemy.orm import Session
 
 from app.agents.enrichment.enrichment_agent import EnrichmentAgent
+from app.agents.enrichment.live_enrichment_agent import LiveEnrichmentAgent
 from app.agents.triage.triage_agent import TriageAgent
 from app.core.config import settings
 from app.models.models import AlertModel
 from app.services.audit import log_action
+from app.services.staleness import describe_enrichment_change, mark_incidents_stale_for_alert
+from app.services.threat_intel import get_client, resolve_provider
 
 # Statuses a triage / enrichment step may move forward from. Any other status (CLOSED, CORRELATED,
 # ...) is left untouched: a closed alert is never re-opened and an alert is never moved backwards.
@@ -25,6 +28,12 @@ INTEL_DISCLAIMER = (
     "it does not mean the indicator is verified safe."
 )
 
+
+LIVE_DISCLAIMER = (
+    "Reputation reported by VirusTotal's public API (aggregated third-party engine verdicts) at the time shown. "
+    "It is not independently verified by SOCMind AI and can include false positives. "
+    "CLEAN, UNKNOWN or 'not found' never mean the indicator is verified safe."
+)
 
 UNAVAILABLE_DISCLAIMER = (
     "No threat-intelligence provider is available (THREAT_INTEL_MOCK_MODE is off and no live provider is implemented). "
@@ -67,18 +76,35 @@ def triage_alert_record(db: Session, alert: AlertModel) -> Dict[str, Any]:
 
 
 def enrich_alert_record(db: Session, alert: AlertModel) -> Dict[str, Any]:
-    """Runs IOC extraction + mock enrichment and stores it in normalized_data['enrichment']. Caller commits.
+    """Runs IOC extraction + enrichment and stores it in normalized_data['enrichment']. Caller commits.
 
-    The enrichment result keeps the EnrichmentAgent contract (total_iocs_extracted, summary, iocs);
-    only the additive provenance keys intel_mode / verified / disclaimer are attached here.
+    The source is chosen by services.threat_intel.resolve_provider(): the local mock (default), VirusTotal
+    (opt-in, needs an API key) or no lookups at all. The enrichment result keeps the EnrichmentAgent contract
+    (total_iocs_extracted, summary, iocs); only additive provenance keys are attached here:
+    intel_mode ("mock" | "live" | "unavailable"), verified, disclaimer and, when relevant, fallback_reason /
+    provider / lookup_summary / incomplete.
+
+    If the result materially changes what the incident analysis is built on, the affected open incidents are marked
+    stale (see services.staleness); the next investigation or pipeline run then recomputes them.
     """
-    agent = EnrichmentAgent(mock_mode=True)
-    mock_enabled = settings.THREAT_INTEL_MOCK_MODE
-    if mock_enabled:
+    previous = (alert.normalized_data or {}).get("enrichment")
+    choice = resolve_provider()
+    if choice.active == "virustotal":
+        agent = LiveEnrichmentAgent(get_client(), settings.VIRUSTOTAL_MAX_LOOKUPS_PER_ALERT)
+        result = agent.enrich_alert(alert_dict(alert))
+        result["intel_mode"] = "live"
+        result["provider"] = "VirusTotal"
+        result["disclaimer"] = LIVE_DISCLAIMER
+    elif choice.active == "mock":
+        agent = EnrichmentAgent(mock_mode=True)
         result = agent.enrich_alert(alert_dict(alert))
         result["intel_mode"] = "mock"
         result["disclaimer"] = INTEL_DISCLAIMER
+        if choice.reason:   # live lookups were requested but are not possible: say so, never fall back silently
+            result["requested_provider"] = choice.requested
+            result["fallback_reason"] = choice.reason
     else:
+        agent = EnrichmentAgent(mock_mode=True)
         result = _extraction_only_result(agent, alert_dict(alert))
         result["intel_mode"] = "unavailable"
         result["disclaimer"] = UNAVAILABLE_DISCLAIMER
@@ -88,10 +114,21 @@ def enrich_alert_record(db: Session, alert: AlertModel) -> Dict[str, Any]:
     alert.normalized_data = data
     if alert.status in ENRICH_FROM:
         alert.status = "ENRICHED"
+    change = describe_enrichment_change(previous, result)
+    marked = mark_incidents_stale_for_alert(db, alert.id, change, agent.agent_name) if change else []
     log_action(db, agent.agent_name, "ALERT_ENRICHED", alert.id,
-               {"total_iocs_extracted": result["total_iocs_extracted"], "summary": result["summary"],
-                "intel_mode": result["intel_mode"]})
+               {**_audit_details(result), "material_change": change is not None, "incidents_marked_stale": marked})
     return result
+
+
+def _audit_details(result: Dict[str, Any]) -> Dict[str, Any]:
+    """What goes in the audit entry: counts and provenance only. Never keys, URLs or raw provider responses."""
+    details = {"total_iocs_extracted": result["total_iocs_extracted"], "summary": result["summary"],
+               "intel_mode": result["intel_mode"]}
+    for key in ("provider", "lookup_summary", "incomplete", "fallback_reason"):
+        if key in result:
+            details[key] = result[key]
+    return details
 
 
 def _extraction_only_result(agent: EnrichmentAgent, alert: Dict[str, Any]) -> Dict[str, Any]:
