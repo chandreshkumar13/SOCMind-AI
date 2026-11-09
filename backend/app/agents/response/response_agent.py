@@ -1,4 +1,6 @@
-from typing import Any, Dict, List, Optional
+import ipaddress
+import re
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 IMPACT_ORDER = {"NONE": 0, "LOW": 1, "MEDIUM": 2, "HIGH": 3}
 MOCK_INTEL_CAVEAT = "The local threat intelligence is a mock and unverified; confirm the indicator with an authoritative source first."
@@ -27,6 +29,118 @@ def _flagged_iocs(alerts: List[Dict[str, Any]], ioc_type: str) -> List[str]:
             if ioc.get("type") == ioc_type and ioc.get("reputation") == "MALICIOUS" and ioc.get("value"):
                 values.add(ioc["value"])
     return sorted(values)
+
+
+# Internal address space: RFC 1918, loopback and link-local. Any other usable address counts as external. This list is
+# deliberate: ipaddress.is_private also covers the documentation ranges the synthetic sample data uses for external attackers.
+_INTERNAL_NETWORKS = tuple(ipaddress.ip_network(n) for n in (
+    "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "127.0.0.0/8", "169.254.0.0/16", "::1/128", "fe80::/10", "fc00::/7"))
+_IPV4 = re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b")   # word boundaries, so a sentence-ending full stop does not hide an address
+_ORIGIN_WORDS = re.compile(r"\b(from|source|attacker|origin|originating)\b", re.IGNORECASE)
+_TARGET_WORDS = re.compile(r"\b(to|towards?|outbound|target|victim|against|destination|destined)\b", re.IGNORECASE)
+_ROLE_WINDOW = 80   # characters before an address that are searched for the word giving its role (never past its own line)
+
+
+def _canonical(value: Any) -> Optional[str]:
+    """The canonical text of a valid IP address, or None when the value is missing or not an address."""
+    if value in (None, ""):
+        return None
+    try:
+        return ipaddress.ip_address(str(value).strip()).compressed
+    except ValueError:
+        return None
+
+
+def _scope(value: Any) -> Optional[str]:
+    """'internal' or 'external' for a usable address. None when it is missing, not an address, or can never be a block target
+    (multicast, unspecified, reserved or broadcast)."""
+    address = _canonical(value)
+    if address is None:
+        return None
+    ip = ipaddress.ip_address(address)
+    if ip.is_multicast or ip.is_unspecified or ip.is_reserved or address == "255.255.255.255":
+        return None
+    return "internal" if any(ip in net for net in _INTERNAL_NETWORKS) else "external"
+
+
+def _named_roles(alert: Dict[str, Any]) -> Tuple[Set[str], Set[str]]:
+    """The addresses the alert's own text gives a role: (named as the origin, named as the target).
+
+    The role of an address is decided by the nearer of an origin word and a target word just before it. So 'from X against Y'
+    makes X the origin and Y the target, whichever field each one is stored in."""
+    text = "\n".join(str(alert.get(k) or "") for k in ("alert_title", "description", "command_line"))
+    origins: Set[str] = set()
+    targets: Set[str] = set()
+    for found in _IPV4.finditer(text):
+        address = _canonical(found.group())
+        if address is None:
+            continue
+        line_start = text.rfind("\n", 0, found.start()) + 1      # each field is its own line, so a role never leaks across fields
+        before = text[max(line_start, found.start() - _ROLE_WINDOW):found.start()]
+        origin_words = list(_ORIGIN_WORDS.finditer(before))
+        target_words = list(_TARGET_WORDS.finditer(before))
+        nearest_origin = origin_words[-1].end() if origin_words else -1
+        nearest_target = target_words[-1].end() if target_words else -1
+        if nearest_origin < 0 and nearest_target < 0:
+            continue
+        (origins if nearest_origin > nearest_target else targets).add(address)
+    return origins, targets
+
+
+def _attacker(alert: Dict[str, Any]) -> Tuple[Optional[str], str]:
+    """The external address the alert names as the origin of the activity, with the basis for naming it.
+
+    Only the alert's text decides, and only between the addresses its fields carry: field names are never trusted. Returns
+    (None, reason) when the text does not establish one external origin: no usable address, no direction words, more than one
+    origin, the same address named as both origin and target, or an internal origin."""
+    candidates = {a for a in (_canonical(alert.get("source_ip")), _canonical(alert.get("destination_ip"))) if a and _scope(a)}
+    if not candidates:
+        return None, "no usable IP address is recorded on the alert"
+    origins, targets = _named_roles(alert)
+    origins, targets = origins & candidates, targets & candidates
+    if origins & targets:
+        return None, "the alert text names the same address as both origin and target"
+    if len(origins) > 1:
+        return None, "the alert text names more than one origin"
+    if origins:
+        attacker = next(iter(origins))
+        basis = f"the alert text names {attacker} as the origin of the failed logins"
+    elif len(targets) == 1 and len(candidates) == 2:
+        named = next(iter(targets))
+        attacker = next(iter(candidates - {named}))
+        basis = f"the alert text names {named} as the target, so {attacker} is the origin"
+    else:
+        return None, "the alert text does not say which address is the origin"
+    if _scope(attacker) != "external":
+        return None, f"{attacker} is an internal address, which is not proposed for a perimeter block"
+    return attacker, basis
+
+
+def _direction_of(alert: Dict[str, Any], address: str) -> Tuple[str, str]:
+    """What the alert's own text says about the direction of traffic involving an address: (role, reason).
+
+    role is 'outbound' (the host connected to the address), 'inbound' (the address connected to the host), 'ambiguous' (the text
+    gives conflicting directions) or 'unknown' (the text does not say). A flagged address alone never gives a direction."""
+    origins, targets = _named_roles(alert)
+    if address in targets and address in origins:
+        return "ambiguous", f"the alert text gives conflicting directions for {address}"
+    if address in targets:
+        external_origins = sorted(o for o in origins if _scope(o) == "external")
+        if external_origins:
+            return "ambiguous", (f"the alert text gives conflicting directions for {address}: "
+                                 f"it names {', '.join(external_origins)} as the origin of the same traffic")
+        return "outbound", f"the alert text names {address} as the target of the host's traffic"
+    if address in origins:
+        return "inbound", f"the alert text names {address} as the origin of the traffic, so it is inbound, not outbound"
+    return "unknown", "the alert does not state the direction of the traffic"
+
+
+def _unique_alerts(alerts) -> List[Dict[str, Any]]:
+    """The alerts once each, in the order first seen."""
+    seen: Dict[Any, Dict[str, Any]] = {}
+    for alert in alerts:
+        seen.setdefault(alert.get("id"), alert)
+    return list(seen.values())
 
 
 class ResponseAgent:
@@ -98,12 +212,45 @@ class ResponseAgent:
                          else "The intelligence is a mock, so the file may be benign.")
             domain_risk = ("VirusTotal engine verdicts can include false positives, so the domain may be legitimate." if live
                            else "The intelligence is a mock, so the domain may be legitimate.")
-            bad_ips = _flagged_iocs(alerts, "IP")
-            m = match(["c2", "command & control", "command and control", "beacon"]) or ([a for a in alerts if a.get("destination_ip") in bad_ips] if bad_ips else [])
-            if m:
-                targets = bad_ips or sorted({a["destination_ip"] for a in m if a.get("destination_ip")})
-                add(3, "ioc_blocking", f"Block outbound traffic to {', '.join(targets) or 'the suspicious destination'} at the perimeter firewall", ", ".join(targets),
-                    f"Hosts communicated with a destination flagged by command-and-control alerts or {source}.", m, "LOW",
+            # An outbound block needs BOTH the alert's own statement that the host connected to an external address AND a MALICIOUS
+            # threat-intelligence verdict for that address, recorded as the alert's destination. A keyword alone, a verdict alone, or
+            # a flagged address in a source field is never enough. Every address that is not blocked is explained, and an internal
+            # address is never proposed for a perimeter block.
+            bad_ips = {_canonical(v) for v in _flagged_iocs(alerts, "IP")}     # addresses rated MALICIOUS by the threat intelligence
+            blocks: Dict[str, List[Tuple[Dict[str, Any], str]]] = {}
+            unexplained: Dict[str, Tuple[List[Dict[str, Any]], str, str]] = {}   # address -> (alerts, reason, kind)
+            for a in alerts:
+                src, dst = _canonical(a.get("source_ip")), _canonical(a.get("destination_ip"))
+                keyword = _has(a, ["c2", "command & control", "command and control", "beacon"])
+                for x in sorted({v for v in (src, dst) if v}):
+                    malicious = x in bad_ips and _scope(x) == "external"
+                    if not (malicious or (keyword and x == dst)):
+                        continue
+                    if _scope(x) != "external":
+                        kind, reason = "internal", "it is an internal address, which is never proposed for a perimeter block"
+                    else:
+                        role, basis = _direction_of(a, x)
+                        if role == "outbound" and x != dst:
+                            role, basis = "ambiguous", (f"the alert records {x} as its source address, but its text says the host "
+                                                        "connected to it, so the record conflicts")
+                        if role == "outbound" and malicious:
+                            blocks.setdefault(x, []).append((a, basis))
+                            continue
+                        if role == "outbound":
+                            kind, reason = "verdict", ("the alert states the host connected to it, but threat intelligence does not rate it "
+                                                       "malicious, and a command-and-control keyword alone is not grounds for an outbound block")
+                        elif role == "unknown" and x == src and x != dst:
+                            kind, reason = "direction", ("it is recorded only as a source address, and the alert does not state that the host "
+                                                         "connected to it")
+                        else:
+                            kind, reason = "direction", basis
+                    unexplained.setdefault(x, ([], reason, kind))[0].append(a)
+            if blocks:
+                block_targets = sorted(blocks)
+                block_alerts = _unique_alerts(a for x in block_targets for a, _ in blocks[x])
+                bases = "; ".join(sorted({basis for x in block_targets for _, basis in blocks[x]}))
+                add(3, "ioc_blocking", f"Block outbound traffic to {', '.join(block_targets)} at the perimeter firewall", ", ".join(block_targets),
+                    f"Hosts communicated with a destination flagged by command-and-control alerts or {source}; {bases}.", block_alerts, "LOW",
                     benefit="Cuts the command-and-control channel and prevents data leaving to that destination.",
                     operational="Legitimate traffic to the same address (shared hosting, CDN) would also be blocked.",
                     risk=f"Blocking an address that is actually legitimate disrupts business traffic; {risk_basis}.",
@@ -111,6 +258,29 @@ class ResponseAgent:
                     approvals=["Network/Firewall owner"],
                     preconditions=[caveat, "Check that no business service uses the destination."],
                     validation=["Confirm blocked connection attempts appear in the firewall logs.", "Confirm no business application reports failures."])
+            explained = {x: info for x, info in unexplained.items() if x not in blocks}
+            for kind, template, validation in (
+                ("direction", "Confirm the direction of traffic involving {addrs} before any outbound block",
+                 ["Confirm from the connection logs whether the host connected to the address."]),
+                ("verdict", "Check the threat-intelligence verdict for {addrs} before any outbound block",
+                 ["Confirm the address carries a MALICIOUS rating from the threat-intelligence source before any outbound block."]),
+                ("internal", "Do not block {addrs} at the perimeter: it is an internal address, so review its activity as an internal host",
+                 ["Confirm the address is an internal host and not an external destination."]),
+            ):
+                addresses = sorted(x for x in explained if explained[x][2] == kind)
+                if not addresses:
+                    continue
+                kind_alerts = _unique_alerts(a for x in addresses for a in explained[x][0])
+                reasons = "; ".join(f"{x}: {explained[x][1]}" for x in addresses)
+                add(8, "investigation", template.format(addrs=", ".join(addresses)), ", ".join(addresses),
+                    f"No outbound block is proposed for these addresses: {reasons}.", kind_alerts, "NONE",
+                    benefit="Keeps an address that is not established as outbound, or not rated malicious, off the firewall until it is checked.",
+                    operational="None; no change is made to any system.",
+                    risk="An outbound block without both the stated direction and a malicious rating can block a legitimate or internal address.",
+                    rollback="Not applicable.",
+                    approvals=["SOC Analyst"],
+                    preconditions=["Read the raw connection logs and the threat-intelligence record for the address before deciding on any block."],
+                    validation=validation)
             hashes = _flagged_iocs(alerts, "SHA256") + _flagged_iocs(alerts, "SHA1") + _flagged_iocs(alerts, "MD5")
             if hashes:
                 hm = [a for a in alerts if a.get("file_hash") in hashes] or alerts
@@ -136,17 +306,38 @@ class ResponseAgent:
                     validation=["Confirm lookups for the domain are refused.", "Confirm no business application reports failures."])
             m = match(["brute force", "failed ssh", "failed password", "failed login", "password spray"])
             if m:
-                src = sorted({a["destination_ip"] or a["source_ip"] for a in m if (a.get("destination_ip") or a.get("source_ip"))})
+                # The origin is the address the alert's own text names as the attacker, never a field name. Where the text does not
+                # establish it, no IP address is proposed: the lockout/MFA step and a check of the raw logs remain.
                 tgt = ', '.join(sorted({a['host'] for a in m if a.get('host')}))
-                add(4, "ioc_blocking", f"Rate-limit or block the remote source {', '.join(src)} and enforce lockout/MFA on {tgt}", ", ".join(src),
-                    "Repeated failed authentication indicates a brute-force attempt.", m, "LOW",
-                    benefit="Stops further password guessing against the target.",
-                    operational="Users behind a shared address, or who mistype passwords, may be locked out.",
-                    risk="Blocking a shared or internal address locks out legitimate users.",
-                    rollback="Remove the rate limit/block rule and unlock the affected accounts.",
-                    approvals=["Network/Firewall owner", "Identity/IAM owner"],
-                    preconditions=["Confirm the source address is not an internal or partner system."],
-                    validation=["Confirm failed attempts from the source stop.", "Confirm legitimate users can still sign in."])
+                resolved, unresolved = [], []
+                for a in m:
+                    attacker, basis = _attacker(a)
+                    (resolved if attacker else unresolved).append((a, attacker, basis))
+                attackers = sorted({attacker for _, attacker, _ in resolved})
+                if attackers:
+                    bases = "; ".join(sorted({basis for _, _, basis in resolved}))
+                    note = f" {len(unresolved)} other alert(s) do not establish the origin and are not blocked." if unresolved else ""
+                    add(4, "ioc_blocking", f"Rate-limit or block the remote source {', '.join(attackers)} and enforce lockout/MFA on {tgt}", ", ".join(attackers),
+                        f"Repeated failed authentication from {', '.join(attackers)}: {bases}.{note}", [a for a, _, _ in resolved], "LOW",
+                        benefit="Stops further password guessing from the origin address against the target.",
+                        operational="Users behind a shared address, or who mistype passwords, may be locked out.",
+                        risk="Blocking a shared or internal address locks out legitimate users. The origin comes from the alert text, so confirm it in the raw logs.",
+                        rollback="Remove the rate limit/block rule and unlock the affected accounts.",
+                        approvals=["Network/Firewall owner", "Identity/IAM owner"],
+                        preconditions=["Confirm in the raw logs that the origin address is an external attacker, not an internal or partner system."],
+                        validation=["Confirm failed attempts from the origin stop.", "Confirm legitimate users can still sign in."])
+                else:
+                    reasons = "; ".join(sorted({basis for _, _, basis in unresolved})) or "no alert establishes the origin"
+                    add(4, "credentials", f"Enforce lockout/MFA on {tgt} and confirm the source address before any IP block", tgt,
+                        f"Repeated failed authentication indicates a brute-force attempt, but no IP address is proposed for blocking because {reasons}.",
+                        m, "LOW",
+                        benefit="Stops password guessing against the target accounts without blocking an address that may be the victim.",
+                        operational="Accounts that mistype passwords may be locked out or required to use MFA.",
+                        risk="Locking accounts does not stop the attacker's address, and the origin must be identified before any block.",
+                        rollback="Unlock the accounts and remove the MFA requirement.",
+                        approvals=["Identity/IAM owner", "SOC Analyst"],
+                        preconditions=["Read the raw failed-login records to identify the origin address before any IP block."],
+                        validation=["Confirm lockout or MFA applies to the affected accounts."])
             m = match(["currentversion\\run", "reg.exe add", "schtasks", "autorun"])
             if m:
                 h = sorted({a["host"] for a in m if a.get("host")})

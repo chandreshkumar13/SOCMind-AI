@@ -228,14 +228,20 @@ def test_finance_incident_covers_blocking_persistence_hash_and_evidence_preserva
     assert [r["id"] for r in recs] == [f"REC-{n}" for n in range(1, len(recs) + 1)]
 
 
-def test_blocking_is_driven_by_malicious_reputation_in_the_project_contract():
+def test_blocking_is_driven_by_malicious_reputation_and_the_alerts_own_statement_of_direction():
     inc = {"id": "I", "severity": "HIGH"}
     base = [A("a", "2026-09-03T08:00:00Z", host="H", destination_ip="9.9.9.9", alert_title="Outbound connection"),
             A("b", "2026-09-03T08:05:00Z", host="H", destination_ip="9.9.9.9", alert_title="Another")]
+    stated = [dict(a, description="Beaconing traffic detected towards 9.9.9.9.") for a in base]
     flagged = [dict(a, normalized_data=_iocs(("IP", "9.9.9.9", "MALICIOUS"))) for a in base]
-    clean = [dict(a, normalized_data=_iocs(("IP", "9.9.9.9", "CLEAN"))) for a in base]
+    flagged_stated = [dict(a, normalized_data=_iocs(("IP", "9.9.9.9", "MALICIOUS"))) for a in stated]
+    clean = [dict(a, description="Traffic observed towards 9.9.9.9.", normalized_data=_iocs(("IP", "9.9.9.9", "CLEAN"))) for a in base]
     actions = lambda alerts: [r["action"] for r in ResponseAgent().recommend(inc, alerts, {"evidence_strength": "moderate"})["recommendations"]]
-    assert any(a.startswith("Block outbound traffic to 9.9.9.9") for a in actions(flagged))
+    # the alert states that the host connected to the flagged address: the outbound block is proposed
+    assert any(a.startswith("Block outbound traffic to 9.9.9.9") for a in actions(flagged_stated))
+    # a flagged address alone does not establish the direction: no outbound block, and the missing evidence is named
+    assert not any(a.startswith("Block outbound") for a in actions(flagged))
+    assert any(a.startswith("Confirm the direction of traffic involving 9.9.9.9") for a in actions(flagged))
     assert not any(a.startswith("Block outbound") for a in actions(clean))
     assert not any(a.startswith("Block outbound") for a in actions(base))          # no enrichment, no blocking proposal
 

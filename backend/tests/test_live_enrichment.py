@@ -255,6 +255,9 @@ def test_live_findings_are_attributed_to_virustotal_and_never_called_mock(iso_cl
     recs = iso_client.get(f"/api/v1/incidents/{inc['id']}").json()["details"]["recommendations"]
     block = next(r for r in recs if r["action"].startswith("Block outbound traffic to 185.220.101.5"))
     assert "VirusTotal" in block["justification"] and any("VirusTotal" in p for p in block["preconditions"])
+    # the block rests on the alert that states the traffic went to the address, not on the flagged verdict alone
+    assert block["supporting_evidence"] == ["alert:ALT-2026-004"]
+    assert "as the target of the host's traffic" in block["justification"]
     assert "MOCK" not in json.dumps(recs) and "mock" not in block["risk_if_wrong"].lower()
     assert all(r["requires_approval"] is True and r["executed"] is False and r["status"] == "PENDING" for r in recs)
 
