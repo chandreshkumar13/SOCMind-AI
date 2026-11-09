@@ -53,7 +53,7 @@ Properties of a run:
   text. Deterministic: the same alert always scores the same.
 - **Enrichment** (`agents/enrichment/enrichment_agent.py`, `tools/mock_intel.py`): extracts IPv4/IPv6, SHA256/SHA1/MD5,
   URLs and domains from structured fields and free text, de-duplicates them, and looks each up in a **local mock
-  dataset**. See "Threat-intelligence modes" below.
+  dataset** by default, or on VirusTotal when live mode is enabled. See "Threat-intelligence modes" below.
 - **Correlation** (`agents/correlation/correlation_agent.py`): two alerts are linked when they share a host, source IP,
   destination IP or file hash **and** are within the time window (default 24 h, 1-168). Linking is transitive. A shared
   username never links alerts by itself. Timestamps are compared in UTC. Alerts that are `CLOSED`, have no id, or have no valid timestamp are never linked;
@@ -80,9 +80,33 @@ RESPONSE_SIMULATED` (simulation is only reachable from `RESPONSE_APPROVED`). `ME
 another when correlation finds that two incidents belong together.
 
 **Approval** (`human_approval_status`): `PENDING → APPROVED | REJECTED`. A decision is final, with one exception: if
-new correlated alerts change the incident afterwards, the decision is voided, the status returns to `OPEN` /
-`PENDING`, the old decision and any simulation are kept in `details.review_history`, and an `APPROVAL_RESET` audit
-entry is written.
+the evidence under it changes afterwards, the decision is withdrawn, the status returns to `OPEN` / `PENDING`, the old
+decision and any simulation are kept in `details.review_history` (with `superseded_by`), and an `APPROVAL_RESET` audit
+entry is written. Two things trigger this: new correlated alerts, and a material change to an alert's threat-intelligence
+result (see below). Withdrawing a decision is never an execution; it only means a person must review the new recommendations.
+
+### Staleness of derived analysis (`services/staleness.py`)
+
+An incident's investigation and recommendations are computed from its alerts' triage and enrichment. When an alert's
+enrichment is recorded, `enrich_alert_record` compares it with the previous result using a fingerprint: the intel mode and
+provider, whether lookups are incomplete, the extracted indicators, and the verdict and evidence of every flagged indicator.
+Timestamps, retrieval times, cache hits and lookup counters are ignored, so a re-run that returns the same verdicts changes
+nothing. Reputations of unflagged indicators are ignored too, because the analysis never quotes them.
+
+When the fingerprint changes, every open incident that contains the alert and already has analysis gets:
+`investigation_stale` and `recommendations_stale` set to `true`, a `stale_reasons` entry (for example
+`threat-intelligence source changed: mock -> live (VirusTotal)`), an `INCIDENT_STALE` audit entry, and (if a decision was
+recorded) a withdrawn decision as above. The next pipeline run, or a direct re-investigation, recomputes the findings from the
+latest stored enrichment; the next recommendation run clears the reasons. Incidents with no analysis yet are not marked, and
+merged incidents are never touched. The pipeline runs enrichment before investigation, so a change made during a run is
+picked up in the same run.
+
+Marking at change time is not the only safeguard. Each investigation stores `analysis_basis`: a digest of every alert's
+enrichment as it was when the analysis ran. Before investigating, each pipeline run compares those digests with the current
+data (`reconcile_incidents_with_evidence`) and marks any fresh incident that no longer matches. This also refreshes analysis
+built before this tracking existed (reason: "analysis was built before change tracking"). Such incidents are refreshed once,
+and a decision recorded on them is withdrawn once, because the approved advice may rest on outdated intelligence; a person
+must then review it again. Withdrawals and refreshes are always audited, and nothing is executed.
 
 ### Approved is not executed
 
@@ -110,13 +134,67 @@ written; error details are truncated to 300 characters and contain no stack trac
 
 ## Threat-intelligence modes
 
-| `intel_mode` | When | What it means |
-| --- | --- | --- |
-| `mock` | `THREAT_INTEL_MOCK_MODE=true` (default) | IOCs are looked up in a small **local mock dataset** (`tools/mock_intel.py`). Not live, not verified. `CLEAN` / `UNKNOWN` only mean "the mock has no malicious record". |
-| `unavailable` | `THREAT_INTEL_MOCK_MODE=false` | IOCs are extracted but **not looked up**. Every reputation is `UNKNOWN` with `lookup_performed: false`; it means "not checked". |
+`services/threat_intel.py::resolve_provider()` picks the source for every enrichment, in this order:
 
-There is **no live provider** (VirusTotal, AbuseIPDB and so on); none is implemented, and the project's safety rules
-forbid real credentials. Every enrichment result carries `verified: false`, `intel_mode` and a `disclaimer`.
+1. `THREAT_INTEL_MOCK_MODE=false` → **`unavailable`**: IOCs are extracted, nothing is looked up.
+2. `THREAT_INTEL_PROVIDER=virustotal` and a non-empty `VIRUSTOTAL_API_KEY` → **`virustotal`** (live, opt-in).
+3. `THREAT_INTEL_PROVIDER=virustotal` without a key, or an unknown provider name → **`mock`** with a `fallback_reason`.
+4. Otherwise (the default) → **`mock`**.
+
+| `intel_mode` | Source | What it means |
+| --- | --- | --- |
+| `mock` | `tools/mock_intel.py` | A small local dataset. Not live, not verified. `CLEAN` / `UNKNOWN` only mean "the mock has no malicious record". |
+| `live` | VirusTotal public API v3 | Third-party engine verdicts, attributed to VirusTotal and **not independently verified**. |
+| `unavailable` | none | `lookup_performed: false`; every reputation is `UNKNOWN` = "not checked". |
+
+Every enrichment result carries `verified: false`, `intel_mode` and a `disclaimer`. Live results add `provider`,
+`lookup_summary`, `incomplete` and, per indicator, `lookup_status`, `detections`, `detected_by`, `retrieved_at`,
+`reference_url` and `cached`. The original contract (`total_iocs_extracted`, `summary`, `iocs[]` with `type`, `value`,
+`source`, `reputation`, `confidence`, `evidence`, `provider`) is unchanged.
+
+### How a live lookup works (`tools/virustotal.py`, `agents/enrichment/live_enrichment_agent.py`)
+
+`LiveEnrichmentAgent` subclasses the existing `EnrichmentAgent` and overrides only the lookup, so extraction,
+de-duplication and the result shape are shared with the mock path. For each extracted indicator:
+
+1. **Eligibility.** Only public IPs (not private, loopback, link-local, multicast, reserved, documentation or CGNAT
+   ranges), file hashes (MD5/SHA-1/SHA-256) and plausible public domains are sent. URLs are never sent. Values are
+   validated per type and percent-encoded; the VirusTotal base URL is a constant, so alert text can never redirect a
+   request. Ineligible indicators get `lookup_status: skipped_*` and cost nothing.
+2. **Cache.** Completed lookups (24 h) and "not found" answers (1 h) are served from memory at no cost.
+3. **Budget.** At most `VIRUSTOTAL_MAX_LOOKUPS_PER_ALERT` requests per alert, within a sliding window of
+   `VIRUSTOTAL_REQUESTS_PER_MINUTE` / `VIRUSTOTAL_REQUESTS_PER_DAY`. When the budget is gone the indicator is reported as
+   `budget_exceeded` / `rate_limited`. **The code never sleeps to wait for quota.**
+4. **Request.** One `GET` with the key in the `x-apikey` header, a connect/read timeout, no redirects and no retries.
+5. **Answer mapping.** 200 → verdict from `last_analysis_stats`; 404 → `UNKNOWN` (`not_found`); 401/403 → `auth_error`
+   (lookups stop until the app is restarted with a working key); 429 → `rate_limited` and **all** requests pause for
+   `Retry-After` (default 60 s; until 00:00 UTC for a daily-quota error); timeouts, 5xx, unusable JSON → `timeout` /
+   `error`. After three consecutive failures lookups pause for 60 s (`circuit_open`).
+
+Only a small summary is stored (counts, up to five detecting engine names, the report link), never the raw response.
+
+### Partial enrichment and retries
+
+`incomplete` is true when any indicator ended in a *retryable* status (`rate_limited`, `budget_exceeded`, `timeout`,
+`error`, `circuit_open`). The orchestrator then (a) marks the Enrichment stage `partial` with a note and a run warning,
+which makes the run's `outcome` **partial** (a quota is not an error, but the work is not finished), and (b) re-enriches
+that alert on the next run; completed indicators come from the cache, so a later run only spends quota on what is
+missing. Permanent outcomes (`not_found`, `auth_error`, `skipped_*`) are not retried. Because the cache is in memory, a
+restart forgets it, so a restart can cost quota again.
+
+### Secrets
+
+`VIRUSTOTAL_API_KEY` is a `SecretStr`. It exists only in the request header: it is not in any URL, result, audit entry,
+API response (`GET /config` returns only `api_key_configured: true/false`), exception text or log line. Failures are
+reported with fixed status texts, never with raw server or library messages, and the `httpx` request log is silenced so
+indicator values and provider URLs do not reach the application log. Tests assert all of this, including against a fake
+server that echoes the key back in its error bodies.
+
+### What this does not do
+
+It reads reports. It never submits files or URLs for scanning, and nothing here blocks, quarantines or changes
+anything: recommendations that mention a live verdict are still proposals that need a human decision, and an approved
+response is only simulated.
 
 ## Time handling
 

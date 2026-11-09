@@ -19,6 +19,7 @@ Design rules
 import threading
 import time
 import uuid
+from contextlib import contextmanager
 from datetime import datetime
 from typing import Any, Callable, Dict, List, Optional
 
@@ -30,10 +31,17 @@ from app.services.incident_service import (
     DecisionError, correlate_and_store, investigate_incident, recommend_for_incident,
 )
 from app.services.pipeline_steps import enrich_alert_record, triage_alert_record
+from app.services.staleness import reconcile_incidents_with_evidence
 
 _RUN_LOCK = threading.Lock()
 MAX_ERROR_LENGTH = 300
 MAX_ITEMS = 50   # ids listed per stage in the run report; `processed` always holds the true count
+
+
+def _needs_enrichment(alert: AlertModel) -> bool:
+    """True when an alert has no enrichment yet, or its live lookups were left incomplete (quota, limits, errors)."""
+    enrichment = (alert.normalized_data or {}).get("enrichment")
+    return enrichment is None or (isinstance(enrichment, dict) and bool(enrichment.get("incomplete")))
 
 
 class PipelineBusy(Exception):
@@ -52,16 +60,25 @@ def _error_text(exc: Exception) -> str:
     return f"{type(exc).__name__}: {exc}"[:MAX_ERROR_LENGTH]
 
 
+@contextmanager
+def pipeline_lock():
+    """Holds the single run lock for one pipeline run or one manual correlation. It never waits: if the lock is already
+    held it raises PipelineBusy at once. The lock is not reentrant, so it must not be taken again inside a call chain
+    that already holds it (the correlation step and every other stage run inside a run that holds it)."""
+    if not _RUN_LOCK.acquire(blocking=False):
+        raise PipelineBusy("A pipeline run or correlation is already in progress.")
+    try:
+        yield
+    finally:
+        _RUN_LOCK.release()
+
+
 class PipelineOrchestrator:
     agent_name = "Orchestrator"
 
     def run(self, db: Session, alert_ids: Optional[List[str]] = None, window_hours: int = 24) -> Dict[str, Any]:
-        if not _RUN_LOCK.acquire(blocking=False):
-            raise PipelineBusy("A pipeline run is already in progress.")
-        try:
+        with pipeline_lock():
             return self._run(db, alert_ids, window_hours)
-        finally:
-            _RUN_LOCK.release()
 
     def _run(self, db: Session, alert_ids: Optional[List[str]], window_hours: int) -> Dict[str, Any]:
         run_id = uuid.uuid4().hex[:12]
@@ -88,10 +105,19 @@ class PipelineOrchestrator:
 
         stages.append(self._per_item_stage(db, "Triage Agent", alert_pks,
                                            lambda a: "triage" not in (a.normalized_data or {}), triage_alert_record))
-        stages.append(self._per_item_stage(db, "Enrichment Agent", alert_pks,
-                                           lambda a: "enrichment" not in (a.normalized_data or {}), enrich_alert_record))
+        stages.append(self._per_item_stage(db, "Enrichment Agent", alert_pks, _needs_enrichment, enrich_alert_record))
         if stages[1]["status"] != "success":
             warnings.append("Some alerts have no enrichment result; investigation and recommendations ran without that intelligence.")
+        incomplete = [a.id for a in db.query(AlertModel).filter(AlertModel.id.in_(alert_pks)).all()
+                      if isinstance((a.normalized_data or {}).get("enrichment"), dict)
+                      and (a.normalized_data or {})["enrichment"].get("incomplete")]
+        if incomplete:
+            # Not a fault (a quota is not an error), but not fully done either: report it as partial and retry next run
+            if stages[1]["status"] == "success":
+                stages[1]["status"] = "partial"
+            stages[1]["notes"].append(f"{len(incomplete)} alert(s) have threat-intelligence lookups that could not be completed yet.")
+            warnings.append(f"{len(incomplete)} alert(s) have incomplete threat-intelligence lookups (request quota, per-alert limit or "
+                            "provider errors); run the pipeline again later to complete them. Findings that depend on that intelligence may be missing.")
 
         corr = self._stage(db, "Correlation Agent", lambda: correlate_and_store(db, window_hours))
         stages.append(corr["stage"])
@@ -99,6 +125,11 @@ class PipelineOrchestrator:
         if corr_result.get("alerts_without_valid_timestamp"):
             warnings.append("Alerts without a valid timestamp cannot be correlated: "
                             + ", ".join(corr_result["alerts_without_valid_timestamp"]))
+
+        # Analysis built on alert data that has since changed (or before change tracking existed) is marked stale first,
+        # so the investigation below refreshes it from the latest stored evidence
+        reconcile_incidents_with_evidence(db)
+        db.commit()
 
         # Investigation: new/updated incidents and any whose investigation is missing or stale
         incidents = db.query(IncidentModel).filter(IncidentModel.status != "MERGED").all()
@@ -127,7 +158,7 @@ class PipelineOrchestrator:
             "run_id": run_id, "started_at": started.isoformat(), "finished_at": datetime.utcnow().isoformat(),
             "duration_ms": int((time.perf_counter() - t0) * 1000),
             "status": status, "outcome": outcome,
-            "alerts_in_scope": len(alert_pks), "unknown_alert_ids": unknown, "closed_alert_ids": closed if requested else [],
+            "alerts_in_scope": len(alert_pks), "alerts_with_incomplete_enrichment": len(incomplete), "unknown_alert_ids": unknown, "closed_alert_ids": closed if requested else [],
             "stages": stages, "warnings": warnings,
             "incidents_created": corr_result["created"], "incidents_updated": corr_result["updated"],
             "incidents_unchanged": corr_result["unchanged"], "incidents_awaiting_human_review": pending,

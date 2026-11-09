@@ -1,4 +1,5 @@
 import pytest
+from datetime import datetime, timedelta, timezone
 from fastapi.testclient import TestClient
 from app.main import app
 from app.db.session import init_db
@@ -77,6 +78,41 @@ def test_search_functionality():
     alerts = response.json()
     assert len(alerts) >= 1
     assert "powershell" in alerts[0]["alert_title"].lower() or "powershell" in (alerts[0]["command_line"] or "").lower()
+
+
+def test_search_finds_an_alert_by_its_exact_or_partial_id(iso_client):
+    for alert_id, title in [("ALT-2026-SRCH42", "Unrelated first alert"), ("ALT-2026-OTHER7", "Unrelated second alert")]:
+        payload = {"id": alert_id, "alert_title": title, "source": "CrowdStrike EDR", "severity": "LOW",
+                   "host": "ID-SEARCH-HOST", "timestamp": "2026-09-03T08:00:00Z"}
+        assert iso_client.post("/api/v1/alerts", json=payload).status_code == 201
+
+    def found(term):
+        return sorted(a["id"] for a in iso_client.get("/api/v1/alerts", params={"search": term}).json())
+
+    assert found("ALT-2026-SRCH42") == ["ALT-2026-SRCH42"]                  # exact ID
+    assert found("srch42") == ["ALT-2026-SRCH42"]                           # partial ID, any case
+    assert found("ALT-2026-") == ["ALT-2026-OTHER7", "ALT-2026-SRCH42"]     # shared prefix matches both
+    assert found("nothing-like-this") == []
+
+
+def test_search_reaches_an_alert_outside_the_first_100_and_caps_results(iso_client):
+    base = datetime(2026, 9, 3, 8, 0, tzinfo=timezone.utc)
+    needle = {"id": "ALT-OLD-NEEDLE", "alert_title": "Needle outside the first page", "source": "CrowdStrike EDR",
+              "severity": "LOW", "host": "OLD-HOST", "timestamp": (base - timedelta(days=30)).strftime("%Y-%m-%dT%H:%M:%SZ")}
+    assert iso_client.post("/api/v1/alerts", json=needle).status_code == 201
+    for i in range(105):
+        payload = {"id": f"ALT-BULK-{i:03d}", "alert_title": "Bulk sweep alert", "source": "CrowdStrike EDR",
+                   "severity": "LOW", "host": "BULK-HOST", "timestamp": (base + timedelta(minutes=i)).strftime("%Y-%m-%dT%H:%M:%SZ")}
+        assert iso_client.post("/api/v1/alerts", json=payload).status_code == 201
+
+    first_page = [a["id"] for a in iso_client.get("/api/v1/alerts", params={"limit": 100}).json()]
+    assert len(first_page) == 100 and "ALT-OLD-NEEDLE" not in first_page        # the plain list cannot reach it
+
+    found = [a["id"] for a in iso_client.get("/api/v1/alerts", params={"search": "needle outside"}).json()]
+    assert found == ["ALT-OLD-NEEDLE"]                                           # server-side search can
+
+    capped = iso_client.get("/api/v1/alerts", params={"search": "bulk sweep", "limit": 100}).json()
+    assert len(capped) == 100                                                    # 105 matches, one full page returned
 
 
 def test_valid_alert_ingestion_and_normalization():

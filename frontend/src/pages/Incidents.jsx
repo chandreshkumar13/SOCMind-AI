@@ -1,15 +1,22 @@
 import React, { useState } from 'react';
-import { UserCheck, RefreshCw, Play, GitMerge } from 'lucide-react';
+import { UserCheck, RefreshCw, Play, GitMerge, Search, Filter } from 'lucide-react';
 import StatusBadge from '../components/StatusBadge';
 import PipelineRunReport from '../components/PipelineRunReport';
+import StaleNotice from '../components/StaleNotice';
 import { ActionButton, EmptyCard, ErrorCard, LoadingCard } from '../components/StateCards';
 import { api } from '../api';
 import useAsync from '../lib/useAsync';
-import { formatUtc, groupFindings, reviewState, simulationState, statusLabel } from '../lib/view';
+import { formatUtc, groupFindings, reviewState, safeVirusTotalUrl, simulationState, statusLabel } from '../lib/view';
+import {
+  APPROVAL_FILTERS, DEFAULT_CRITERIA, SEVERITY_ORDER, SORT_OPTIONS, STATUS_FILTERS,
+  filterAndSortIncidents, isDefaultView, shownSummary,
+} from '../lib/incidentFilters';
 
 const sectionTitle = { fontSize: '12px', color: 'var(--accent-cyan)', textTransform: 'uppercase', letterSpacing: '0.05em', fontWeight: 700, marginBottom: '8px' };
 const panel = { background: 'rgba(0, 0, 0, 0.2)', padding: '12px 16px', borderRadius: 'var(--radius-sm)', border: '1px solid var(--border-color)', marginBottom: '14px' };
 const muted = { fontSize: '12px', color: 'var(--text-muted)' };
+const filterInput = { padding: '8px 12px', borderRadius: 'var(--radius-sm)', border: '1px solid var(--border-color)', background: 'var(--bg-dark)', color: 'var(--text-main)', fontSize: '13px' };
+const pill = (active) => ({ padding: '6px 10px', borderRadius: 'var(--radius-sm)', border: '1px solid var(--border-color)', background: active ? 'var(--accent-cyan)' : 'transparent', color: active ? '#090d16' : 'var(--text-muted)', fontSize: '11px', fontWeight: 700, cursor: 'pointer' });
 
 function Tag({ children, color = 'var(--text-muted)' }) {
   return <span style={{ fontSize: '10px', fontWeight: 700, padding: '1px 6px', borderRadius: '4px', border: `1px solid ${color}`, color, marginRight: '8px' }}>{children}</span>;
@@ -108,6 +115,21 @@ export function Investigation({ inv }) {
           <div style={{ ...sectionTitle, color: '#fde047' }}>Mock threat intelligence — unverified ({groups.mock_intel.length})</div>
           <div style={{ ...muted, marginBottom: '6px' }}>From the local mock intelligence tool. This is not confirmed real-world intelligence.</div>
           {groups.mock_intel.map((f, i) => <div key={i} style={{ fontSize: '13px', padding: '3px 0' }}>• {f.statement}</div>)}
+        </div>
+      )}
+
+      {groups.external_intel.length > 0 && (
+        <div style={{ ...panel, borderColor: 'rgba(79, 172, 254, 0.45)' }}>
+          <div style={{ ...sectionTitle, color: '#4facfe' }}>VirusTotal intelligence — not independently verified ({groups.external_intel.length})</div>
+          <div style={{ ...muted, marginBottom: '6px' }}>Third-party engine verdicts reported by VirusTotal. They can include false positives and are not confirmed by SOCMind AI.</div>
+          {groups.external_intel.map((f, i) => (
+            <div key={i} style={{ fontSize: '13px', padding: '3px 0' }}>
+              • {f.statement}
+              {safeVirusTotalUrl(f.reference_url) && (
+                <> <a href={safeVirusTotalUrl(f.reference_url)} target="_blank" rel="noopener noreferrer" style={{ color: 'var(--accent-cyan)' }}>VirusTotal report</a></>
+              )}
+            </div>
+          ))}
         </div>
       )}
 
@@ -270,11 +292,7 @@ function IncidentDetail({ id, onChanged }) {
   return (
     <div style={{ marginTop: '14px' }}>
       {actionError && <ErrorCard title="Action not completed" message={actionError} />}
-      {(details.investigation_stale || details.recommendations_stale) && (
-        <div style={{ ...panel, color: '#fde047', fontSize: '12px' }}>
-          New correlated alerts changed this incident. {details.investigation_stale ? 'The investigation is out of date. ' : ''}{details.recommendations_stale ? 'The recommendations are out of date.' : ''}
-        </div>
-      )}
+      <StaleNotice details={details} />
       <div style={{ display: 'flex', gap: '10px', marginBottom: '14px', flexWrap: 'wrap' }}>
         <ActionButton variant="ghost" busy={busy} onClick={() => act(() => api(`/incidents/${id}/investigate`, { method: 'POST' }))}>Re-run investigation</ActionButton>
         <ActionButton variant="ghost" busy={busy} disabled={inc.human_approval_status !== 'PENDING'}
@@ -299,6 +317,7 @@ export default function Incidents({ incidents, loading, error, refresh, refreshA
   const [busy, setBusy] = useState(false);
   const [notice, setNotice] = useState(null);
   const [run, setRun] = useState(null);
+  const [criteria, setCriteria] = useState(DEFAULT_CRITERIA);   // search, filters and sort; kept across refreshes
 
   const runAction = async (fn) => {
     setBusy(true);
@@ -324,6 +343,9 @@ export default function Incidents({ incidents, loading, error, refresh, refreshA
 
   const visible = (incidents || []).filter((i) => i.status !== 'MERGED');
   const pending = visible.filter((i) => i.status === 'RESPONSE_PROPOSED' && i.human_approval_status === 'PENDING').length;
+  const shown = filterAndSortIncidents(incidents, criteria);
+  const updateCriteria = (patch) => setCriteria((current) => ({ ...current, ...patch }));
+  const clearFilters = () => setCriteria(DEFAULT_CRITERIA);
 
   return (
     <div>
@@ -339,6 +361,47 @@ export default function Incidents({ incidents, loading, error, refresh, refreshA
         </div>
       </div>
 
+      {visible.length > 0 && (
+        <div className="glass-card" style={{ marginBottom: '12px', display: 'flex', gap: '12px', alignItems: 'center', flexWrap: 'wrap' }}>
+          <div style={{ position: 'relative', flex: 1, minWidth: '240px', maxWidth: '420px' }}>
+            <Search size={16} style={{ position: 'absolute', left: '12px', top: '50%', transform: 'translateY(-50%)', color: 'var(--text-muted)' }} />
+            <input
+              type="text"
+              aria-label="Search incidents"
+              placeholder="Search id, title, summary, host, user or IP..."
+              value={criteria.search}
+              onChange={(e) => updateCriteria({ search: e.target.value })}
+              style={{ ...filterInput, width: '100%', paddingLeft: '36px' }}
+            />
+          </div>
+          <div role="group" aria-label="Filter by severity" style={{ display: 'flex', gap: '6px', alignItems: 'center', flexWrap: 'wrap' }}>
+            <Filter size={16} color="var(--text-muted)" />
+            {['ALL', ...SEVERITY_ORDER].map((sev) => (
+              <button
+                key={sev}
+                type="button"
+                aria-pressed={criteria.severity === sev}
+                onClick={() => updateCriteria({ severity: sev })}
+                style={pill(criteria.severity === sev)}
+              >
+                {sev}
+              </button>
+            ))}
+          </div>
+          <select aria-label="Filter by approval" value={criteria.approval} onChange={(e) => updateCriteria({ approval: e.target.value })} style={filterInput}>
+            {APPROVAL_FILTERS.map((v) => <option key={v} value={v}>{v === 'ALL' ? 'Any approval' : `Approval: ${v.toLowerCase()}`}</option>)}
+          </select>
+          <select aria-label="Filter by workflow status" value={criteria.status} onChange={(e) => updateCriteria({ status: e.target.value })} style={filterInput}>
+            {STATUS_FILTERS.map((v) => <option key={v} value={v}>{v === 'ALL' ? 'Any status' : statusLabel(v)}</option>)}
+          </select>
+          <select aria-label="Sort incidents" value={criteria.sort} onChange={(e) => updateCriteria({ sort: e.target.value })} style={filterInput}>
+            {SORT_OPTIONS.map((o) => <option key={o.value} value={o.value}>{o.label}</option>)}
+          </select>
+          {!isDefaultView(criteria) && <ActionButton variant="ghost" onClick={clearFilters}>Clear filters</ActionButton>}
+        </div>
+      )}
+      {visible.length > 0 && <div style={{ ...muted, marginBottom: '12px' }}>{shownSummary(shown.length, visible.length)}</div>}
+
       {notice && <ErrorCard title={notice.error ? 'Action failed' : 'Done'} message={notice.text} />}
       <PipelineRunReport run={run} />
 
@@ -350,8 +413,14 @@ export default function Incidents({ incidents, loading, error, refresh, refreshA
         </EmptyCard>
       )}
 
+      {!loading && !error && visible.length > 0 && shown.length === 0 && (
+        <EmptyCard title="No incidents match the current filters">
+          Try a different search term or change the filters. <ActionButton variant="ghost" onClick={clearFilters}>Clear filters</ActionButton>
+        </EmptyCard>
+      )}
+
       <div style={{ display: 'flex', flexDirection: 'column', gap: '20px' }}>
-        {visible.map((inc) => {
+        {shown.map((inc) => {
           const open = openId === inc.id;
           return (
             <div key={inc.id} className="glass-card" style={{ borderLeft: '4px solid var(--accent-cyan)' }}>

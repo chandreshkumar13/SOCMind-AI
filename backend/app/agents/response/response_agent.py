@@ -2,6 +2,12 @@ from typing import Any, Dict, List, Optional
 
 IMPACT_ORDER = {"NONE": 0, "LOW": 1, "MEDIUM": 2, "HIGH": 3}
 MOCK_INTEL_CAVEAT = "The local threat intelligence is a mock and unverified; confirm the indicator with an authoritative source first."
+LIVE_INTEL_CAVEAT = ("The reputation comes from VirusTotal and is not independently verified; open the VirusTotal report and "
+                     "confirm the indicator before acting.")
+
+
+def _uses_live_intel(alerts: List[Dict[str, Any]]) -> bool:
+    return any((((a.get("normalized_data") or {}).get("enrichment") or {}).get("intel_mode") == "live") for a in alerts)
 
 
 def _text(a: Dict[str, Any]) -> str:
@@ -84,41 +90,49 @@ class ResponseAgent:
                     preconditions=["Identify the services that use each account.", "Prepare the new credentials and a communication to the owners."],
                     validation=["Confirm old sessions and tokens are revoked.", "Review sign-in logs for further use of the old credentials."],
                     reversible=False)
+            live = _uses_live_intel(alerts)
+            caveat = LIVE_INTEL_CAVEAT if live else MOCK_INTEL_CAVEAT
+            source = "VirusTotal (not independently verified)" if live else "MOCK intelligence (unverified)"
+            risk_basis = "VirusTotal engine verdicts can include false positives" if live else "the intelligence behind it is a mock"
+            file_risk = ("VirusTotal engine verdicts can include false positives, so the file may be benign." if live
+                         else "The intelligence is a mock, so the file may be benign.")
+            domain_risk = ("VirusTotal engine verdicts can include false positives, so the domain may be legitimate." if live
+                           else "The intelligence is a mock, so the domain may be legitimate.")
             bad_ips = _flagged_iocs(alerts, "IP")
             m = match(["c2", "command & control", "command and control", "beacon"]) or ([a for a in alerts if a.get("destination_ip") in bad_ips] if bad_ips else [])
             if m:
                 targets = bad_ips or sorted({a["destination_ip"] for a in m if a.get("destination_ip")})
                 add(3, "ioc_blocking", f"Block outbound traffic to {', '.join(targets) or 'the suspicious destination'} at the perimeter firewall", ", ".join(targets),
-                    "Hosts communicated with a destination flagged by command-and-control alerts or MOCK intelligence (unverified).", m, "LOW",
+                    f"Hosts communicated with a destination flagged by command-and-control alerts or {source}.", m, "LOW",
                     benefit="Cuts the command-and-control channel and prevents data leaving to that destination.",
                     operational="Legitimate traffic to the same address (shared hosting, CDN) would also be blocked.",
-                    risk="Blocking an address that is actually legitimate disrupts business traffic; the intelligence behind it is a mock.",
+                    risk=f"Blocking an address that is actually legitimate disrupts business traffic; {risk_basis}.",
                     rollback="Delete the firewall rule.",
                     approvals=["Network/Firewall owner"],
-                    preconditions=[MOCK_INTEL_CAVEAT, "Check that no business service uses the destination."],
+                    preconditions=[caveat, "Check that no business service uses the destination."],
                     validation=["Confirm blocked connection attempts appear in the firewall logs.", "Confirm no business application reports failures."])
             hashes = _flagged_iocs(alerts, "SHA256") + _flagged_iocs(alerts, "SHA1") + _flagged_iocs(alerts, "MD5")
             if hashes:
                 hm = [a for a in alerts if a.get("file_hash") in hashes] or alerts
                 add(6, "ioc_blocking", f"Add file hash(es) {', '.join(h[:16] + '...' for h in hashes[:3])} to the endpoint blocklist and scan for other copies",
-                    ", ".join(hashes[:3]), "File hash(es) were rated malicious by MOCK intelligence (unverified).", hm, "LOW",
+                    ", ".join(hashes[:3]), f"File hash(es) were rated malicious by {source}.", hm, "LOW",
                     benefit="Prevents the file from running again on managed endpoints and finds other copies.",
                     operational="A wrongly blocked file stops working on every endpoint.",
-                    risk="The intelligence is a mock, so the file may be benign.",
+                    risk=file_risk,
                     rollback="Remove the hash from the blocklist.",
                     approvals=["Endpoint security owner"],
-                    preconditions=[MOCK_INTEL_CAVEAT, "Confirm the file is not a legitimate tool."],
+                    preconditions=[caveat, "Confirm the file is not a legitimate tool."],
                     validation=["Confirm the blocklist entry is active.", "Review the scan results for other hosts."])
             domains = _flagged_iocs(alerts, "DOMAIN")
             if domains:
                 add(6, "ioc_blocking", f"Block DNS resolution of {', '.join(domains[:5])} at the DNS/proxy layer", ", ".join(domains[:5]),
-                    "Domain(s) were rated malicious by MOCK intelligence (unverified).", alerts, "LOW",
+                    f"Domain(s) were rated malicious by {source}.", alerts, "LOW",
                     benefit="Prevents hosts from reaching attacker-controlled domains.",
                     operational="Legitimate use of the domain would be blocked.",
-                    risk="The intelligence is a mock, so the domain may be legitimate.",
+                    risk=domain_risk,
                     rollback="Remove the DNS/proxy block rule.",
                     approvals=["Network/Security operations owner"],
-                    preconditions=[MOCK_INTEL_CAVEAT],
+                    preconditions=[caveat],
                     validation=["Confirm lookups for the domain are refused.", "Confirm no business application reports failures."])
             m = match(["brute force", "failed ssh", "failed password", "failed login", "password spray"])
             if m:

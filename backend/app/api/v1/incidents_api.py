@@ -9,6 +9,7 @@ from app.schemas.incident import CorrelateRequest, IncidentDetailOut, IncidentOu
 from app.services.incident_service import (
     DecisionError, correlate_and_store, investigate_incident, recommend_for_incident, review_incident, simulate_response,
 )
+from app.services.orchestrator import PipelineBusy, pipeline_lock
 
 router = APIRouter()
 
@@ -50,8 +51,13 @@ def get_incident(incident_id: str, db: Session = Depends(get_db)):
 
 @router.post("/incidents/correlate", summary="Correlate Alerts into Incidents")
 def correlate(payload: Optional[CorrelateRequest] = None, db: Session = Depends(get_db)):
-    """Groups non-closed alerts that share a host, IP or file hash within the time window into incidents."""
-    return correlate_and_store(db, payload.window_hours if payload else 24)
+    """Groups non-closed alerts that share a host, IP or file hash within the time window into incidents.
+    409 if a pipeline run or another correlation is already in progress."""
+    try:
+        with pipeline_lock():
+            return correlate_and_store(db, payload.window_hours if payload else 24)
+    except PipelineBusy as e:
+        raise HTTPException(status.HTTP_409_CONFLICT, str(e))
 
 
 @router.post("/incidents/{incident_id}/investigate", response_model=IncidentDetailOut, summary="Investigate an Incident")

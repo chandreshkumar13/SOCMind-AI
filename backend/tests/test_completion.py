@@ -162,7 +162,10 @@ def test_config_is_truthful_and_contains_no_secrets(iso_client, monkeypatch):
     text = iso_client.get("/api/v1/config").text
     cfg = json.loads(text)
     assert cfg["execution_mode"] == "simulation_only" and cfg["authentication"]["enabled"] is False
-    assert cfg["threat_intel"]["mode"] == "mock" and cfg["threat_intel"]["live_provider_implemented"] is False
+    ti = cfg["threat_intel"]
+    assert ti["mode"] == "mock" and ti["active_provider"] == "mock" and ti["requested_provider"] == "mock"
+    assert ti["live_provider_implemented"] is True and ti["live_provider_active"] is False      # implemented, but opt-in
+    assert ti["virustotal"]["api_key_configured"] is False and ti["virustotal"]["quota"] is None and ti["fallback_reason"] is None
     assert cfg["llm"]["used_by_agents"] is False and cfg["database_engine"] == "sqlite"
     assert "sk-should-never-appear" not in text and "private" not in text and "API_KEY" not in text
     monkeypatch.setattr(settings, "THREAT_INTEL_MOCK_MODE", False)

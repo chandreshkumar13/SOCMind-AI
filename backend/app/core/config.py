@@ -1,5 +1,6 @@
 import os
-from typing import List
+from typing import List, Optional
+from pydantic import SecretStr
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -29,6 +30,20 @@ class Settings(BaseSettings):
     # Threat intelligence: True uses the built-in LOCAL MOCK lookups. False means "no provider available":
     # IOCs are still extracted but no reputation lookup is performed (no live provider is implemented).
     THREAT_INTEL_MOCK_MODE: bool = True
+
+    # Which reputation source to use when lookups are enabled: "mock" (default, offline) or "virustotal".
+    # Live lookups are opt-in: they only happen when this is "virustotal" AND VIRUSTOTAL_API_KEY is set.
+    # If "virustotal" is requested without a key, the app falls back to the labelled mock provider.
+    THREAT_INTEL_PROVIDER: str = "mock"
+
+    # VirusTotal public API. The key is a SecretStr so it can never be printed, logged or serialized by accident.
+    VIRUSTOTAL_API_KEY: Optional[SecretStr] = None
+    VIRUSTOTAL_TIMEOUT_SECONDS: float = 10.0           # per request (connect + read)
+    VIRUSTOTAL_MALICIOUS_THRESHOLD: int = 3            # engines that must flag an indicator for MALICIOUS
+    VIRUSTOTAL_MAX_LOOKUPS_PER_ALERT: int = 5          # network requests allowed per enrichment of one alert
+    VIRUSTOTAL_REQUESTS_PER_MINUTE: int = 4            # public API quota
+    VIRUSTOTAL_REQUESTS_PER_DAY: int = 500             # public API quota
+    VIRUSTOTAL_CACHE_TTL_SECONDS: int = 86400          # in-memory cache of completed lookups
 
     # Logging
     LOG_LEVEL: str = "INFO"

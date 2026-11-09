@@ -3,6 +3,7 @@
 Uses the isolated `iso_client` fixture (own temporary database per test); nothing touches socmind.db.
 """
 import json
+import threading
 
 from sqlalchemy import create_engine, text
 from sqlalchemy.exc import IntegrityError
@@ -16,7 +17,9 @@ from app.agents.triage.triage_agent import TriageAgent
 from app.db.session import ensure_columns
 from app.models.base import Base
 from app.models.models import IncidentModel
+from app.api.v1 import incidents_api
 from app.services import orchestrator
+from app.services.incident_service import correlate_and_store
 
 
 def A(i, ts, **kw):
@@ -317,6 +320,95 @@ def test_a_second_concurrent_run_is_refused(iso_client):
         orchestrator._RUN_LOCK.release()
     assert res.status_code == 409 and "already in progress" in res.json()["detail"]
     assert iso_client.post("/api/v1/pipeline/run").status_code == 200           # the lock is released again
+
+
+def _in_thread(call):
+    """Runs one HTTP call on a worker thread and keeps its response, so the test can hold a run or correlation open."""
+    outcome = {}
+    worker = threading.Thread(target=lambda: outcome.update(res=call()), daemon=True)
+    worker.start()
+    return worker, outcome
+
+
+def test_manual_correlation_is_refused_while_a_pipeline_run_holds_the_lock(iso_client, monkeypatch):
+    iso_client.post("/api/v1/alerts/seed")
+    entered, release = threading.Event(), threading.Event()
+    real_triage = orchestrator.triage_alert_record
+
+    def paused_triage(db, alert):
+        entered.set()
+        release.wait(10)
+        return real_triage(db, alert)
+
+    monkeypatch.setattr(orchestrator, "triage_alert_record", paused_triage)
+    worker, outcome = _in_thread(lambda: iso_client.post("/api/v1/pipeline/run"))
+    try:
+        assert entered.wait(10)
+        res = iso_client.post("/api/v1/incidents/correlate")
+        assert res.status_code == 409 and "already in progress" in res.json()["detail"]
+    finally:
+        release.set()
+        worker.join(10)
+    assert outcome["res"].status_code == 200 and outcome["res"].json()["outcome"] == "success"
+    assert not orchestrator._RUN_LOCK.locked()
+
+
+def test_pipeline_is_refused_while_a_manual_correlation_holds_the_lock(iso_client, monkeypatch):
+    iso_client.post("/api/v1/alerts/seed")
+    entered, release = threading.Event(), threading.Event()
+    real_correlate = incidents_api.correlate_and_store
+
+    def paused_correlate(db, window_hours=24):
+        entered.set()
+        release.wait(10)
+        return real_correlate(db, window_hours)
+
+    monkeypatch.setattr(incidents_api, "correlate_and_store", paused_correlate)
+    worker, outcome = _in_thread(lambda: iso_client.post("/api/v1/incidents/correlate"))
+    try:
+        assert entered.wait(10)
+        res = iso_client.post("/api/v1/pipeline/run")
+        assert res.status_code == 409 and "already in progress" in res.json()["detail"]
+    finally:
+        release.set()
+        worker.join(10)
+    assert outcome["res"].status_code == 200 and "created" in outcome["res"].json()
+    assert not orchestrator._RUN_LOCK.locked()
+
+
+def test_the_lock_is_released_after_a_successful_correlation(iso_client):
+    iso_client.post("/api/v1/alerts/seed")
+    assert iso_client.post("/api/v1/incidents/correlate").status_code == 200
+    assert not orchestrator._RUN_LOCK.locked()
+    run = iso_client.post("/api/v1/pipeline/run")
+    assert run.status_code == 200 and run.json()["outcome"] == "success"
+
+
+def test_the_lock_is_released_after_a_correlation_exception(iso_client, monkeypatch):
+    iso_client.post("/api/v1/alerts/seed")
+
+    def failing_correlate(db, window_hours=24):
+        raise RuntimeError("simulated correlation failure")
+
+    monkeypatch.setattr(incidents_api, "correlate_and_store", failing_correlate)
+    res = iso_client.post("/api/v1/incidents/correlate")
+    assert res.status_code == 500 and "simulated" not in res.text
+    assert not orchestrator._RUN_LOCK.locked()
+    monkeypatch.undo()
+    assert iso_client.post("/api/v1/incidents/correlate").status_code == 200
+    assert iso_client.post("/api/v1/pipeline/run").status_code == 200
+
+
+def test_correlate_and_store_never_takes_the_lock(iso_client):
+    iso_client.post("/api/v1/alerts/seed")
+    assert orchestrator._RUN_LOCK.acquire(blocking=False)
+    db = iso_client.session_factory()
+    try:
+        result = correlate_and_store(db, 24)      # would raise PipelineBusy inside this call if it took the lock
+    finally:
+        db.close()
+        orchestrator._RUN_LOCK.release()
+    assert result["groups_found"] >= 1 and len(result["created"]) >= 1
 
 
 def test_pipeline_leaves_an_audit_trail_for_every_stage(iso_client):

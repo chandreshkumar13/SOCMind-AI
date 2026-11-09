@@ -43,6 +43,7 @@ class InvestigationAgent:
     Every finding is labelled so uncertain information is never shown as fact:
       verified   - literally present in a stored alert, triage result, correlation record or log record
       mock_intel - reported by the LOCAL MOCK intelligence tool (unverified; never confirmed intelligence)
+      external_intel - reported by a live provider (VirusTotal); attributed to it and still not independently verified
       hypothesis - an inference from keyword rules; needs analyst confirmation (never 'high' confidence)
     Command lines are only read as text; nothing is executed. Nothing is invented: when data is
     missing the output says so (see `limitations`).
@@ -114,20 +115,33 @@ class InvestigationAgent:
             findings.append(self._finding("verified", "No matching log records were found in the available log source; the timeline is built from alerts only.", basis=[]))
             limitations.append("No log records corroborate the alerts.")
 
-        # ---- mock intelligence (unverified)
-        mock_hits = []
-        enriched = 0
+        # ---- threat intelligence (never confirmed fact): the local mock, or an external provider (VirusTotal)
+        mock_hits, live_hits = [], []
+        enriched = incomplete_alerts = 0
+        modes = set()
         for a in alerts:
             iocs = _enrichment_iocs(a)
-            if (a.get("normalized_data") or {}).get("enrichment"):
+            enr = (a.get("normalized_data") or {}).get("enrichment")
+            mode = "mock"
+            if enr:
                 enriched += 1
+                if isinstance(enr, dict):
+                    mode = enr.get("intel_mode") or "mock"
+                    incomplete_alerts += 1 if enr.get("incomplete") else 0
+                modes.add(mode)
             for ioc in iocs:
                 if ioc.get("reputation") in FLAGGED_REPUTATIONS:
-                    mock_hits.append((a["id"], ioc))
+                    (live_hits if mode == "live" else mock_hits).append((a["id"], ioc))
         if enriched < len(alerts):
             limitations.append(f"{len(alerts) - enriched} alert(s) have no enrichment result.")
-        if enriched:
+        if enriched and modes - {"live"}:
             limitations.append("Threat intelligence is a local mock; reputations (including CLEAN) are not verified.")
+        if "live" in modes:
+            limitations.append("Threat intelligence comes from VirusTotal and is not independently verified; "
+                               "a CLEAN, UNKNOWN or 'not found' result is not proof of safety, and detections can be false positives.")
+        if incomplete_alerts:
+            limitations.append(f"{incomplete_alerts} alert(s) have incomplete threat-intelligence lookups (request quota, "
+                               "per-alert limit or provider errors); some indicators were not checked.")
         seen = set()
         for aid, ioc in mock_hits:
             key = (ioc.get("type"), ioc.get("value"), ioc.get("reputation"))
@@ -138,6 +152,17 @@ class InvestigationAgent:
                                           f"(provider {ioc.get('provider')}). Unverified.",
                                           basis=[f"alert:{aid}", f"intel:{ioc.get('provider')}"], reputation=ioc.get("reputation"),
                                           confidence=ioc.get("confidence")))
+        seen = set()
+        for aid, ioc in live_hits:
+            key = (ioc.get("type"), ioc.get("value"), ioc.get("reputation"))
+            if key in seen:
+                continue
+            seen.add(key)
+            findings.append(self._finding("external_intel", f"VirusTotal reports {ioc.get('type')} {ioc.get('value')} as {str(ioc.get('reputation')).lower()}: "
+                                          f"{ioc.get('evidence')} Not independently verified by SOCMind AI.",
+                                          basis=[f"alert:{aid}", "intel:VirusTotal"], reputation=ioc.get("reputation"),
+                                          confidence=ioc.get("confidence"), reference_url=ioc.get("reference_url"),
+                                          detections=ioc.get("detections"), retrieved_at=ioc.get("retrieved_at")))
 
         # ---- hypotheses
         hypotheses = self._hypotheses(alerts, relevant_logs)
@@ -150,7 +175,7 @@ class InvestigationAgent:
             limitations.append("The incident has no readable alerts.")
         if len(valid) < len(alerts):
             limitations.append(f"{len(alerts) - len(valid)} alert(s) have no valid timestamp and appear last in the timeline.")
-        summary = self._summary(incident, alerts, hosts, first, last, relevant_logs, mock_hits, hypotheses, strength, triage_summary)
+        summary = self._summary(incident, alerts, hosts, first, last, relevant_logs, mock_hits, live_hits, hypotheses, strength, triage_summary)
         return {
             "agent": self.agent_name, "status": "completed",
             "entities": {"hosts": hosts, "users": users, "ips": ips, "hashes": sorted(h for h in hashes if h),
@@ -161,6 +186,7 @@ class InvestigationAgent:
             "correlation": incident.get("correlation"),
             "timeline": timeline, "findings": findings,
             "counts": {"verified": sum(f["type"] == "verified" for f in findings), "mock_intel": sum(f["type"] == "mock_intel" for f in findings),
+                       "external_intel": sum(f["type"] == "external_intel" for f in findings),
                        "hypothesis": len(hypotheses)},
             "limitations": limitations, "summary": summary,
             "note": "Hypotheses are indicative inferences from keyword rules and require analyst confirmation.",
@@ -218,7 +244,7 @@ class InvestigationAgent:
         return results
 
     @staticmethod
-    def _summary(incident, alerts, hosts, first, last, logs, mock_hits, hyps, strength, triage) -> str:
+    def _summary(incident, alerts, hosts, first, last, logs, mock_hits, live_hits, hyps, strength, triage) -> str:
         parts = [f"Incident {incident.get('id', '')} groups {len(alerts)} alert(s) on {', '.join(hosts) or 'unknown host'}"]
         if first and last:
             minutes = int((last - first).total_seconds() // 60)
@@ -229,6 +255,8 @@ class InvestigationAgent:
         parts.append(f"{len(logs)} related log record(s) were reviewed.")
         if mock_hits:
             parts.append(f"Mock (unverified) intelligence flagged {len({(i.get('type'), i.get('value')) for _, i in mock_hits})} indicator(s).")
+        if live_hits:
+            parts.append(f"VirusTotal (not independently verified) flagged {len({(i.get('type'), i.get('value')) for _, i in live_hits})} indicator(s).")
         if hyps:
             parts.append("Possible techniques (hypotheses, not confirmed): " + "; ".join(f"{h['technique']} {h['technique_name']} [{h['confidence']}]" for h in hyps[:6]) + ".")
         parts.append("No automated action has been taken; analyst review is required.")
