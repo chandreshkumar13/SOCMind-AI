@@ -1,8 +1,10 @@
 import React, { useCallback, useEffect, useState } from 'react';
-import { RefreshCw } from 'lucide-react';
+import { Download, RefreshCw } from 'lucide-react';
 import { ActionButton, EmptyCard, ErrorCard, LoadingCard } from '../components/StateCards';
 import { api } from '../api';
 import { auditQuery, formatUtc, previewDetails } from '../lib/view';
+import { auditCsvBlob, auditExportFilename, auditExportNote, downloadBlob } from '../lib/auditCsv';
+import { beginRequest, createRequestGate, initialList, receive } from '../lib/auditLoad';
 
 const PAGE = 50;
 const input = { padding: '8px 10px', borderRadius: 'var(--radius-sm)', border: '1px solid var(--border-color)', background: 'var(--bg-dark)', color: 'var(--text-main)', fontSize: '13px' };
@@ -11,29 +13,28 @@ const input = { padding: '8px 10px', borderRadius: 'var(--radius-sm)', border: '
 export default function AuditLog() {
   const [filters, setFilters] = useState({ actor: '', action: '', target: '' });
   const [applied, setApplied] = useState(filters);
-  const [rows, setRows] = useState([]);
-  const [loading, setLoading] = useState(true);
-  const [error, setError] = useState(null);
-  const [hasMore, setHasMore] = useState(false);
+  const [list, setList] = useState(initialList);
+  const [gate] = useState(createRequestGate);       // numbers the requests; only the newest may change the list
+  const { rows, hasMore, error, loading, nextOffset } = list;   // nextOffset: where the server's paging has reached
 
   const load = useCallback(async (query, offset) => {
-    setLoading(true);
-    setError(null);
+    const id = gate.start();
+    setList(beginRequest);
     try {
       const page = await api(`/audit-logs${auditQuery({ ...query, limit: PAGE, offset })}`);
-      setRows((prev) => (offset === 0 ? page : [...prev, ...page]));
-      setHasMore(page.length === PAGE);
+      setList((state) => receive(gate, id, state, { offset, page }, PAGE));
     } catch (err) {
-      setError(err.message);
-    } finally {
-      setLoading(false);
+      setList((state) => receive(gate, id, state, { offset, error: err.message }, PAGE));
     }
-  }, []);
+  }, [gate]);
 
   useEffect(() => { load(applied, 0); }, [applied, load]);
 
   const apply = (e) => { e.preventDefault(); setApplied({ ...filters }); };
   const set = (key) => (e) => setFilters((f) => ({ ...f, [key]: e.target.value }));
+
+  // Exports the entries loaded on this page, with the filters that were applied to them. Never while a load is running or failed.
+  const exportCsv = () => downloadBlob(auditCsvBlob(rows), auditExportFilename());
 
   return (
     <div>
@@ -79,8 +80,14 @@ export default function AuditLog() {
       )}
       <div style={{ marginTop: '12px', display: 'flex', gap: '12px', alignItems: 'center' }}>
         <span style={{ fontSize: '12px', color: 'var(--text-muted)' }}>{rows.length} entr{rows.length === 1 ? 'y' : 'ies'} loaded, newest first.</span>
-        {hasMore && <ActionButton variant="ghost" busy={loading} onClick={() => load(applied, rows.length)}>Load older entries</ActionButton>}
+        {hasMore && <ActionButton variant="ghost" busy={loading} onClick={() => load(applied, nextOffset)}>Load older entries</ActionButton>}
+        <ActionButton variant="ghost" disabled={rows.length === 0 || loading || Boolean(error)}
+          title={error ? 'Export is unavailable while the audit log has a load error' : rows.length === 0 ? 'Nothing loaded to export' : ''}
+          onClick={exportCsv}>
+          <Download size={12} style={{ verticalAlign: '-2px' }} /> Export CSV
+        </ActionButton>
       </div>
+      <div style={{ marginTop: '6px', fontSize: '12px', color: 'var(--text-muted)' }}>{auditExportNote(rows.length, hasMore, Boolean(error))}</div>
     </div>
   );
 }
