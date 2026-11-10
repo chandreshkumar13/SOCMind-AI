@@ -20,7 +20,7 @@ import threading
 import time
 import uuid
 from contextlib import contextmanager
-from datetime import datetime
+from app.core.clock import utc_now
 from typing import Any, Callable, Dict, List, Optional
 
 from sqlalchemy.orm import Session
@@ -83,7 +83,7 @@ class PipelineOrchestrator:
 
     def _run(self, db: Session, alert_ids: Optional[List[str]], window_hours: int) -> Dict[str, Any]:
         run_id = uuid.uuid4().hex[:12]
-        started = datetime.utcnow()
+        started = utc_now()
         t0 = time.perf_counter()
         stages: List[Dict[str, Any]] = []
         warnings: List[str] = []
@@ -156,7 +156,7 @@ class PipelineOrchestrator:
         pending = db.query(IncidentModel).filter(IncidentModel.human_approval_status == "PENDING",
                                                  IncidentModel.status == "RESPONSE_PROPOSED").count()
         report = {
-            "run_id": run_id, "started_at": started.isoformat(), "finished_at": datetime.utcnow().isoformat(),
+            "run_id": run_id, "started_at": started.isoformat(), "finished_at": utc_now().isoformat(),
             "duration_ms": int((time.perf_counter() - t0) * 1000),
             "status": status, "outcome": outcome,
             "alerts_in_scope": len(alert_pks), "alerts_with_incomplete_enrichment": len(incomplete), "unknown_alert_ids": unknown, "closed_alert_ids": closed if requested else [],

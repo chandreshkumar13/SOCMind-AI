@@ -3,7 +3,7 @@ from app.agents.enrichment.enrichment_agent import EnrichmentAgent
 
 def test_extracts_ips_hashes_and_ignores_file_names():
     alert = {"source_ip": "192.168.10.42", "destination_ip": "185.220.101.5",
-             "file_hash": "2b8a741369359e19864293fe2f7cfef5f58c70425712ef9e3dfa4b13a8efee5d",
+             "file_hash": "1527175195cf32685e8703b31777c1e1a0f88c9c1d658d383ff4cfc6a14417c8",
              "command_line": r"rundll32.exe C:\Users\Public\Temp\update.dll,Start"}
     iocs = EnrichmentAgent().extract_iocs(alert)
     kinds = {(i["type"], i["value"]) for i in iocs}

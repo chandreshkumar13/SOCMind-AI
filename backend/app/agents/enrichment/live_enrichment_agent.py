@@ -1,7 +1,7 @@
 from collections import Counter
 from typing import Any, Dict
 
-from app.agents.enrichment.enrichment_agent import EnrichmentAgent
+from app.agents.enrichment.enrichment_agent import DECODED_SOURCE, EnrichmentAgent
 from app.tools.virustotal import RETRYABLE_STATUSES, STATUS_TEXT, VirusTotalClient
 
 
@@ -18,10 +18,12 @@ class LiveEnrichmentAgent(EnrichmentAgent):
     UNKNOWN with a retryable `lookup_status`, and the result is marked `incomplete` so a later run can finish it.
     """
 
-    def __init__(self, client: VirusTotalClient, max_lookups: int = 5):
+    def __init__(self, client: VirusTotalClient, max_lookups: int = 5, lookup_decoded: bool = False):
         super().__init__(mock_mode=False)
         self.client = client
         self.max_lookups = max(0, int(max_lookups))
+        # Indicators decoded from encoded command lines are sent only when the operator has turned this on
+        self.lookup_decoded = bool(lookup_decoded)
         self._reset()
 
     def _reset(self) -> None:
@@ -29,6 +31,7 @@ class LiveEnrichmentAgent(EnrichmentAgent):
         self._requests = 0
         self._statuses: Counter = Counter()
         self._cached = 0
+        self._decoded_not_sent = 0
 
     def enrich_alert(self, alert_data: Dict[str, Any]) -> Dict[str, Any]:
         self._reset()
@@ -45,12 +48,21 @@ class LiveEnrichmentAgent(EnrichmentAgent):
             "per_alert_limit_reached": self._statuses["budget_exceeded"],
             "failed": self._statuses["timeout"] + self._statuses["error"] + self._statuses["circuit_open"],
             "auth_error": self._statuses["auth_error"],
+            "decoded_not_sent": self._decoded_not_sent,
         }
         result["lookup_performed"] = (self._requests + self._cached) > 0
         result["incomplete"] = retryable > 0
         return result
 
     def _lookup_ioc(self, val: str, ioc_type: str, source_field: str) -> Dict[str, Any]:
+        if source_field == DECODED_SOURCE and not self.lookup_decoded:
+            # Decoded text is not sent to a third party unless the operator opted in. Nothing is requested, nothing is spent.
+            self._decoded_not_sent += 1
+            self._statuses["not_sent_decoded_disabled"] += 1
+            return {"value": val, "type": ioc_type, "source": source_field, "reputation": "UNKNOWN", "confidence": 0.0,
+                    "evidence": STATUS_TEXT["not_sent_decoded_disabled"], "provider": "none",
+                    "lookup_status": "not_sent_decoded_disabled", "detections": None, "detected_by": [],
+                    "retrieved_at": None, "reference_url": None, "cached": False}
         try:
             outcome = self.client.lookup(ioc_type, val, allow_request=self._budget > 0)
         except Exception:  # noqa: BLE001 - one indicator must never break the enrichment of an alert

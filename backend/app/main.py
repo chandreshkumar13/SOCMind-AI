@@ -5,8 +5,13 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 import uvicorn
 
+from app.core.auth import validate_auth_config
 from app.core.config import settings
+from app.core.runtime import process_model_note, worker_processes
 from app.api.v1.router import api_router
+
+# A misconfigured token setup stops the application at startup instead of leaving it open or unusable
+validate_auth_config(settings.AUTH_MODE, settings.AUTH_TOKENS, settings.ENVIRONMENT)
 from app.db.session import init_db
 from app.services.threat_intel import resolve_provider
 
@@ -17,6 +22,9 @@ async def lifespan(app: FastAPI):
     init_db()
     choice = resolve_provider()
     logger.info("Threat intelligence provider: %s%s", choice.active, f" ({choice.reason})" if choice.reason else "")
+    note = process_model_note(worker_processes(), live_provider=choice.active == "virustotal")
+    if note:
+        logger.warning(note)
     yield
 
 # Also ensure DB tables exist upon module import
@@ -39,6 +47,7 @@ app.add_middleware(
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
+    expose_headers=["X-Total-Count"],   # lets the browser read the list totals (see frontend/src/api.js apiPage)
 )
 
 logging.basicConfig(level=getattr(logging, str(settings.LOG_LEVEL).upper(), logging.INFO),

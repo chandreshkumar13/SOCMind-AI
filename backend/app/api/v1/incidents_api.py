@@ -1,15 +1,16 @@
 from typing import List, Optional
 
-from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Response, status
 from sqlalchemy.orm import Session
 
+from app.core.auth import Principal, require
 from app.db.session import get_db
 from app.models.models import AlertModel, IncidentModel
 from app.schemas.incident import CorrelateRequest, IncidentDetailOut, IncidentOut, ReviewRequest
 from app.services.incident_service import (
     DecisionError, correlate_and_store, investigate_incident, recommend_for_incident, review_incident, simulate_response,
 )
-from app.services.incident_state import active_incidents_clause
+from app.services.incident_state import CLOSED, not_merged_clause
 from app.services.orchestrator import PipelineBusy, pipeline_lock
 
 router = APIRouter()
@@ -24,6 +25,7 @@ def _get_incident(db: Session, incident_id: str) -> IncidentModel:
 
 @router.get("/incidents", response_model=List[IncidentOut], summary="List Incidents")
 def list_incidents(
+    response: Response,
     severity: Optional[str] = Query(None),
     incident_status: Optional[str] = Query(None, alias="status"),
     approval: Optional[str] = Query(None, description="PENDING, APPROVED or REJECTED"),
@@ -31,26 +33,30 @@ def list_incidents(
     offset: int = Query(0, ge=0),
     db: Session = Depends(get_db),
 ):
-    q = db.query(IncidentModel).filter(active_incidents_clause())     # merged incidents are never part of the active list
+    q = db.query(IncidentModel).filter(not_merged_clause())           # merged incidents are never listed
+    if not incident_status:
+        q = q.filter(IncidentModel.status != CLOSED)                  # closed incidents are listed only when asked for by status
     if severity:
         q = q.filter(IncidentModel.severity == severity.upper())
     if incident_status:
         q = q.filter(IncidentModel.status == incident_status.upper())
     if approval:
         q = q.filter(IncidentModel.human_approval_status == approval.upper())
+    response.headers["X-Total-Count"] = str(q.count())      # matching records, not just this page
     return q.order_by(IncidentModel.created_at.desc(), IncidentModel.id.desc()).offset(offset).limit(limit).all()
 
 
 @router.get("/incidents/{incident_id}", response_model=IncidentDetailOut, summary="Get Incident Details")
 def get_incident(incident_id: str, db: Session = Depends(get_db)):
     inc = _get_incident(db, incident_id)
-    alerts = db.query(AlertModel).filter(AlertModel.id.in_(inc.correlated_alert_ids or [])).order_by(AlertModel.timestamp).all()
+    alerts = (db.query(AlertModel).filter(AlertModel.id.in_(inc.correlated_alert_ids or []))
+              .order_by(AlertModel.timestamp, AlertModel.id).all())
     out = IncidentDetailOut.model_validate(inc)
     out.alerts = alerts
     return out
 
 
-@router.post("/incidents/correlate", summary="Correlate Alerts into Incidents")
+@router.post("/incidents/correlate", summary="Correlate Alerts into Incidents", dependencies=[Depends(require("analyst"))])
 def correlate(payload: Optional[CorrelateRequest] = None, db: Session = Depends(get_db)):
     """Groups non-closed alerts that share a host, IP or file hash within the time window into incidents.
     409 if a pipeline run or another correlation is already in progress."""
@@ -61,7 +67,7 @@ def correlate(payload: Optional[CorrelateRequest] = None, db: Session = Depends(
         raise HTTPException(status.HTTP_409_CONFLICT, str(e))
 
 
-@router.post("/incidents/{incident_id}/investigate", response_model=IncidentDetailOut, summary="Investigate an Incident")
+@router.post("/incidents/{incident_id}/investigate", response_model=IncidentDetailOut, summary="Investigate an Incident", dependencies=[Depends(require("analyst"))])
 def investigate(incident_id: str, db: Session = Depends(get_db)):
     """Builds the timeline and labelled findings (verified / mock_intel / hypothesis) for an incident."""
     inc = _get_incident(db, incident_id)
@@ -72,7 +78,7 @@ def investigate(incident_id: str, db: Session = Depends(get_db)):
     return get_incident(incident_id, db)
 
 
-@router.post("/incidents/{incident_id}/recommend", response_model=IncidentDetailOut, summary="Generate Response Recommendations")
+@router.post("/incidents/{incident_id}/recommend", response_model=IncidentDetailOut, summary="Generate Response Recommendations", dependencies=[Depends(require("analyst"))])
 def recommend(incident_id: str, db: Session = Depends(get_db)):
     """Generates evidence-based response proposals. Nothing is executed; a human must approve or reject."""
     inc = _get_incident(db, incident_id)
@@ -83,32 +89,38 @@ def recommend(incident_id: str, db: Session = Depends(get_db)):
     return get_incident(incident_id, db)
 
 
-def _review(incident_id: str, decision: str, payload: ReviewRequest, db: Session):
+def _reviewer(principal: Principal, payload: ReviewRequest) -> str:
+    """The authenticated name when there is one (token mode); otherwise the self-asserted name from the request (demo mode)."""
+    return principal.name if principal.authenticated else payload.reviewer
+
+
+def _review(incident_id: str, decision: str, payload: ReviewRequest, db: Session, reviewer: str):
     inc = _get_incident(db, incident_id)
     try:
-        review_incident(db, inc, decision, payload.reviewer, payload.reason)
+        review_incident(db, inc, decision, reviewer, payload.reason)
     except DecisionError as e:
         raise HTTPException(status.HTTP_409_CONFLICT, str(e))
     return get_incident(incident_id, db)
 
 
-@router.post("/incidents/{incident_id}/approve", response_model=IncidentDetailOut, summary="Approve the Proposed Response")
-def approve(incident_id: str, payload: ReviewRequest, db: Session = Depends(get_db)):
-    """Records a human approval. The system only records the decision; it executes no action."""
-    return _review(incident_id, "APPROVED", payload, db)
+@router.post("/incidents/{incident_id}/approve", response_model=IncidentDetailOut, summary="Approve the Proposed Response", dependencies=[Depends(require("approver"))])
+def approve(incident_id: str, payload: ReviewRequest, db: Session = Depends(get_db), principal: Principal = Depends(require("approver"))):
+    """Records a human approval. The system only records the decision; it executes no action.
+    In token mode the reviewer recorded is the name on the token, whatever the request says."""
+    return _review(incident_id, "APPROVED", payload, db, _reviewer(principal, payload))
 
 
-@router.post("/incidents/{incident_id}/reject", response_model=IncidentDetailOut, summary="Reject the Proposed Response")
-def reject(incident_id: str, payload: ReviewRequest, db: Session = Depends(get_db)):
-    return _review(incident_id, "REJECTED", payload, db)
+@router.post("/incidents/{incident_id}/reject", response_model=IncidentDetailOut, summary="Reject the Proposed Response", dependencies=[Depends(require("approver"))])
+def reject(incident_id: str, payload: ReviewRequest, db: Session = Depends(get_db), principal: Principal = Depends(require("approver"))):
+    return _review(incident_id, "REJECTED", payload, db, _reviewer(principal, payload))
 
 
-@router.post("/incidents/{incident_id}/simulate", response_model=IncidentDetailOut, summary="Simulate the Approved Response")
-def simulate(incident_id: str, payload: ReviewRequest, db: Session = Depends(get_db)):
+@router.post("/incidents/{incident_id}/simulate", response_model=IncidentDetailOut, summary="Simulate the Approved Response", dependencies=[Depends(require("analyst"))])
+def simulate(incident_id: str, payload: ReviewRequest, db: Session = Depends(get_db), principal: Principal = Depends(require("analyst"))):
     """Rehearses an APPROVED response. Nothing is executed: the system has no real response integration."""
     inc = _get_incident(db, incident_id)
     try:
-        simulate_response(db, inc, payload.reviewer, payload.reason)
+        simulate_response(db, inc, _reviewer(principal, payload), payload.reason)
     except DecisionError as e:
         raise HTTPException(status.HTTP_409_CONFLICT, str(e))
     return get_incident(incident_id, db)

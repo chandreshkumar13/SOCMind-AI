@@ -15,7 +15,7 @@ export default function Dashboard({ alerts, incidents, stats, setActiveTab }) {
     ? stats.incidents.awaiting_human_review
     : open.filter((i) => i.status === 'RESPONSE_PROPOSED' && i.human_approval_status === 'PENDING').length;
   const agentList = agents.data || [];
-  const healthy = agentList.filter((a) => a.status === 'READY' && a.failures === 0).length;
+  const healthy = agentList.filter((a) => a.failures === 0).length;   // agents with no recorded failure
 
   return (
     <div>
@@ -137,7 +137,7 @@ export default function Dashboard({ alerts, incidents, stats, setActiveTab }) {
                 </div>
                 <div className="agent-status-active">
                   <div className="status-dot"></div>
-                  <span>{agent.failures > 0 ? `${agent.failures} failed` : 'Ready'}</span>
+                  <span>{agent.failures > 0 ? `${agent.failures} failed` : agent.status === 'ACTIVE' ? 'Active' : 'Idle'}</span>
                 </div>
               </div>
             ))}

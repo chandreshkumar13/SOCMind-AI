@@ -1,15 +1,15 @@
 """Persistence logic that turns correlation groups into incident records."""
-from datetime import datetime
 from typing import Any, Dict, List
 
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.agents.correlation.correlation_agent import CorrelationAgent, SEVERITY_ORDER
+from app.core.clock import utc_now
 from app.models.models import AlertModel, IncidentModel
 from app.services.audit import log_action
 from app.services.pipeline_steps import alert_dict
-from app.services.incident_state import active_incidents_clause, is_merged, merged_into_of
+from app.services.incident_state import active_incidents_clause, is_closed, is_merged, merged_into_of
 from app.services.staleness import analysis_basis, details_copy as _details, now_iso as _now_iso, void_decision
 
 # Alert statuses an incident step may move forward from (never CLOSED, never backwards)
@@ -18,7 +18,7 @@ INVESTIGATE_FROM = ("NEW", "TRIAGED", "ENRICHED", "CORRELATED")
 
 
 def next_incident_id(db: Session) -> str:
-    prefix = f"INC-{datetime.utcnow().year}-"
+    prefix = f"INC-{utc_now().year}-"
     numbers = []
     for (iid,) in db.query(IncidentModel.id).filter(IncidentModel.id.like(prefix + "%")).all():
         try:
@@ -64,8 +64,8 @@ def _correlate_once(db: Session, window_hours: int) -> Dict[str, Any]:
         ids = set(group["alert_ids"])
         overlapping = [i for i in db.query(IncidentModel).filter(active_incidents_clause()).order_by(IncidentModel.id).all()
                        if ids & set(i.correlated_alert_ids or [])]
-        correlation_info = {k: group[k] for k in ("shared_entities", "reasons", "confidence", "first_seen", "last_seen", "alert_count")}
-        correlation_info["window_hours"] = window_hours
+        correlation_info = {k: group[k] for k in ("shared_entities", "reasons", "confidence", "first_seen", "last_seen", "alert_count",
+                                                  "span_hours", "window_hours")}
         if not overlapping:
             inc = IncidentModel(
                 id=next_incident_id(db), title=_incident_title(group), severity=group["severity"], status="OPEN",
@@ -92,6 +92,8 @@ def _correlate_once(db: Session, window_hours: int) -> Dict[str, Any]:
                 other_details["merged_into"] = target.id
                 other.details = other_details
                 log_action(db, agent.agent_name, "INCIDENT_MERGED", other.id, {"merged_into": target.id})
+            # Only alerts that are still open can be members: a closed alert never re-enters an incident through a merge
+            merged_ids = sorted(i for i in merged_ids if i in by_id)
             if merged_ids == sorted(target.correlated_alert_ids or []) and len(overlapping) == 1:
                 unchanged.append(target.id)
                 continue
@@ -122,6 +124,8 @@ def _correlate_once(db: Session, window_hours: int) -> Dict[str, Any]:
         "alerts_considered": len(alerts), "groups_found": len(groups),
         "created": created, "updated": updated, "unchanged": unchanged,
         "alerts_without_valid_timestamp": skipped,
+        # Links that were not made because they would stretch a group past the window, each with its reason
+        "span_refusals": agent.last_span_refusals,
         "message": ("Incidents created/updated from correlated alerts." if groups else
                     "Insufficient correlation evidence: no alerts share a host, IP or file hash within the time window."),
     }
@@ -132,8 +136,9 @@ def investigate_incident(db: Session, incident: IncidentModel) -> Dict[str, Any]
     from app.agents.investigation.investigation_agent import InvestigationAgent
     from app.services.log_store import LOG_SOURCE_PATH, load_sample_logs
 
-    _refuse_if_merged(incident)
-    alerts = db.query(AlertModel).filter(AlertModel.id.in_(incident.correlated_alert_ids or [])).all()
+    _refuse_if_inactive(incident)
+    # Closed alerts are never analysed, even if an older record still lists them as members
+    alerts = db.query(AlertModel).filter(AlertModel.id.in_(incident.correlated_alert_ids or []), AlertModel.status != "CLOSED").all()
     agent = InvestigationAgent()
     details = _details(incident)
     logs = load_sample_logs()
@@ -168,13 +173,15 @@ class DecisionError(Exception):
     """Raised when a review decision is not allowed (mapped to HTTP 409)."""
 
 
-def _refuse_if_merged(incident: IncidentModel) -> None:
-    """A merged incident has been folded into another one, so nothing is decided, recommended, investigated or simulated on it.
-    Recognised by incident_state.is_merged (status or merge mark)."""
+def _refuse_if_inactive(incident: IncidentModel) -> None:
+    """A merged or closed incident is not worked on: nothing is decided, recommended, investigated or simulated on it.
+    A merged incident was folded into another one (incident_state.is_merged); a closed one had all of its alerts closed."""
     if is_merged(incident):
         into = merged_into_of(incident)
         where = f" into {into}" if into else ""
         raise DecisionError(f"Incident {incident.id} was merged{where}; act on that incident instead.")
+    if is_closed(incident):
+        raise DecisionError(f"Incident {incident.id} is closed because all of its alerts were closed.")
 
 
 def _has_superseded(recs) -> bool:
@@ -186,14 +193,15 @@ def recommend_for_incident(db: Session, incident: IncidentModel) -> Dict[str, An
     """Runs the Response Agent (investigating first if needed) and stores recommendations."""
     from app.agents.response.response_agent import ResponseAgent
 
-    _refuse_if_merged(incident)
+    _refuse_if_inactive(incident)
     if incident.human_approval_status != "PENDING":
         raise DecisionError("A human decision is already recorded; recommendations can no longer be regenerated.")
     details = _details(incident)
     if not details.get("investigation") or details.get("investigation_stale"):
         investigate_incident(db, incident)
         details = _details(incident)
-    alerts = db.query(AlertModel).filter(AlertModel.id.in_(incident.correlated_alert_ids or [])).all()
+    # Closed alerts are never analysed, even if an older record still lists them as members
+    alerts = db.query(AlertModel).filter(AlertModel.id.in_(incident.correlated_alert_ids or []), AlertModel.status != "CLOSED").all()
     agent = ResponseAgent()
     result = agent.recommend({"id": incident.id, "severity": incident.severity}, [alert_dict(a) for a in alerts], details.get("investigation"))
     details["recommendations"] = result["recommendations"]
@@ -211,7 +219,7 @@ def recommend_for_incident(db: Session, incident: IncidentModel) -> Dict[str, An
 
 def review_incident(db: Session, incident: IncidentModel, decision: str, reviewer: str, reason: str = None) -> IncidentModel:
     """Records a human APPROVED/REJECTED decision. No action is executed."""
-    _refuse_if_merged(incident)
+    _refuse_if_inactive(incident)
     details = _details(incident)
     recs = details.get("recommendations")
     if not recs:
@@ -249,7 +257,7 @@ def simulate_response(db: Session, incident: IncidentModel, actor: str, reason: 
     APPROVED means "a human agreed to the proposal"; SIMULATED means "the workflow was rehearsed". There is no
     state meaning EXECUTED because SOCMind AI has no real response integration.
     """
-    _refuse_if_merged(incident)
+    _refuse_if_inactive(incident)
     details = _details(incident)
     recs = details.get("recommendations") or []
     if incident.human_approval_status != "APPROVED":

@@ -1,6 +1,5 @@
-import os
 from sqlalchemy import create_engine, inspect, text
-from sqlalchemy.orm import sessionmaker, Session
+from sqlalchemy.orm import sessionmaker
 from app.core.config import settings
 from app.models.base import Base
 

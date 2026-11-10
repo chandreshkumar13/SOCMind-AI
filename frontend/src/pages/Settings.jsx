@@ -1,8 +1,9 @@
-import React from 'react';
+import React, { useState } from 'react';
 import { Sliders, Shield, Database, RefreshCw } from 'lucide-react';
 import { ActionButton, ErrorCard, LoadingCard } from '../components/StateCards';
-import { api, API_BASE } from '../api';
+import { api, API_BASE, readStoredToken, storeToken } from '../api';
 import useAsync from '../lib/useAsync';
+import { describeAccessError } from '../lib/view';
 
 const row = { display: 'flex', justifyContent: 'space-between', gap: '16px', padding: '8px 0', borderBottom: '1px solid var(--border-color)', fontSize: '13px' };
 const label = { color: 'var(--text-muted)' };
@@ -19,6 +20,63 @@ function Row({ name, value, note }) {
   );
 }
 
+// Sign-in for token mode. The token is kept for this browser tab only (see api.js) and is never shown back in full.
+function AccessCard() {
+  const [draft, setDraft] = useState('');
+  const [saved, setSaved] = useState(() => readStoredToken() !== '');
+  const [who, setWho] = useState(null);
+  const [message, setMessage] = useState('');
+
+  const check = async () => {
+    try {
+      setWho(await api('/auth/me'));
+      setMessage('');
+    } catch (err) {
+      setWho(null);
+      setMessage(err.message || describeAccessError(err.status));
+    }
+  };
+
+  const save = async () => {
+    storeToken(draft);
+    setSaved(draft.trim() !== '');
+    setDraft('');
+    await check();
+  };
+
+  const clear = () => {
+    storeToken('');
+    setSaved(false);
+    setWho(null);
+    setMessage('');
+  };
+
+  const input = { padding: '6px 10px', borderRadius: 'var(--radius-sm)', border: '1px solid var(--border-color)', background: 'var(--bg-dark)', color: 'var(--text-main)', fontSize: '13px', minWidth: '260px' };
+  return (
+    <div className="glass-card" style={{ marginBottom: '20px' }}>
+      <h3 style={{ fontSize: '15px', marginBottom: '8px' }}>Access</h3>
+      <p style={{ fontSize: '12px', color: 'var(--text-muted)', marginBottom: '10px' }}>
+        If the server runs in token mode, paste your access token here. It is kept for this browser tab only and is cleared when the tab closes.
+        In demo mode no token is needed.
+      </p>
+      <div style={{ display: 'flex', gap: '8px', flexWrap: 'wrap', alignItems: 'center' }}>
+        <input type="password" autoComplete="off" aria-label="Access token" placeholder={saved ? 'A token is saved for this tab' : 'Access token'}
+          value={draft} onChange={(e) => setDraft(e.target.value)} style={input} />
+        <ActionButton onClick={save}>Save and check</ActionButton>
+        <ActionButton variant="ghost" onClick={clear}>Clear token</ActionButton>
+        <ActionButton variant="ghost" onClick={check}>Check access</ActionButton>
+      </div>
+      {who && (
+        <div style={{ fontSize: '13px', marginTop: '10px' }}>
+          {who.authenticated ? <>Signed in as <strong>{who.name}</strong> with the <strong>{who.role}</strong> role.</>
+            : <>Demo mode: no sign-in needed. Actions are allowed and reviewer names are self-asserted.</>}
+        </div>
+      )}
+      {message && <div style={{ fontSize: '12px', color: '#f87171', marginTop: '8px' }}>{message}</div>}
+    </div>
+  );
+}
+
 /** Read-only view of what the backend is actually configured to do (GET /config). Nothing here is editable. */
 export default function Settings() {
   const { loading, error, data: cfg, reload } = useAsync(() => api('/config'), []);
@@ -27,10 +85,12 @@ export default function Settings() {
     <div style={{ maxWidth: '800px' }}>
       <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '16px' }}>
         <span style={{ fontSize: '13px', color: 'var(--text-muted)' }}>
-          Read-only. These values come from the backend at <code>{API_BASE}</code>; change them with environment variables (see <code>.env.example</code>).
+          Read-only configuration. These values come from the backend at <code>{API_BASE}</code>; change them with environment variables (see <code>.env.example</code>).
         </span>
         <ActionButton variant="ghost" onClick={reload}><RefreshCw size={12} style={{ verticalAlign: '-2px' }} /> Refresh</ActionButton>
       </div>
+
+      <AccessCard />
 
       {loading && !cfg && <LoadingCard>Loading configuration...</LoadingCard>}
       {error && <ErrorCard title="Could not load the configuration" message={error} onRetry={reload} />}

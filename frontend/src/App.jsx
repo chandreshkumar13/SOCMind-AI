@@ -7,7 +7,8 @@ import Incidents from './pages/Incidents';
 import AgentActivity from './pages/AgentActivity';
 import AuditLog from './pages/AuditLog';
 import Settings from './pages/Settings';
-import { api } from './api';
+import { api, apiPage } from './api';
+import { appendPage } from './lib/view.js';
 
 export default function App() {
   const [activeTab, setActiveTab] = useState('dashboard');
@@ -19,12 +20,17 @@ export default function App() {
   const [incidentsError, setIncidentsError] = useState(null);
   const [online, setOnline] = useState(null);
   const [stats, setStats] = useState(null);
+  const [alertsTotal, setAlertsTotal] = useState(null);       // matching alerts on the server (X-Total-Count)
+  const [incidentsTotal, setIncidentsTotal] = useState(null);
+  const [loadingMore, setLoadingMore] = useState(null);       // 'alerts' | 'incidents' while a next page is fetched
 
   const fetchAlerts = useCallback(async () => {
     setLoading(true);
     setError(null);
     try {
-      setAlerts(await api('/alerts?limit=100'));
+      const page = await apiPage('/alerts?limit=100');
+      setAlerts(page.data);
+      setAlertsTotal(page.total);
       setOnline(true);
     } catch (err) {
       console.error('API Error:', err);
@@ -39,13 +45,42 @@ export default function App() {
     setIncidentsLoading(true);
     setIncidentsError(null);
     try {
-      setIncidents(await api('/incidents?limit=100'));
+      const page = await apiPage('/incidents?limit=100');
+      setIncidents(page.data);
+      setIncidentsTotal(page.total);
     } catch (err) {
       setIncidentsError(err.message || 'Failed to load incidents');
     } finally {
       setIncidentsLoading(false);
     }
   }, []);
+
+  // The next page continues from what is already loaded, so search and filters on the loaded records are kept.
+  const loadMoreAlerts = useCallback(async () => {
+    setLoadingMore('alerts');
+    try {
+      const page = await apiPage(`/alerts?limit=100&offset=${alerts.length}`);
+      setAlerts((prev) => appendPage(prev, page.data));
+      setAlertsTotal(page.total);
+    } catch (err) {
+      setError(err.message || 'Failed to load more alerts');
+    } finally {
+      setLoadingMore(null);
+    }
+  }, [alerts.length]);
+
+  const loadMoreIncidents = useCallback(async () => {
+    setLoadingMore('incidents');
+    try {
+      const page = await apiPage(`/incidents?limit=100&offset=${(incidents || []).length}`);
+      setIncidents((prev) => appendPage(prev || [], page.data));
+      setIncidentsTotal(page.total);
+    } catch (err) {
+      setIncidentsError(err.message || 'Failed to load more incidents');
+    } finally {
+      setLoadingMore(null);
+    }
+  }, [incidents]);
 
   const fetchStats = useCallback(async () => {
     try {
@@ -91,6 +126,9 @@ export default function App() {
               refreshAlerts={refreshAll}
               seedSampleAlerts={seedSampleAlerts}
               totalAlerts={stats ? stats.alerts.total : undefined}
+              alertsTotal={alertsTotal}
+              loadMoreAlerts={loadMoreAlerts}
+              loadingMore={loadingMore === 'alerts'}
             />
           )}
           {activeTab === 'incidents' && (
@@ -100,6 +138,9 @@ export default function App() {
               error={incidentsError}
               refresh={fetchIncidents}
               refreshAlerts={refreshAll}
+              incidentsTotal={incidentsTotal}
+              loadMoreIncidents={loadMoreIncidents}
+              loadingMore={loadingMore === 'incidents'}
             />
           )}
           {activeTab === 'agents' && <AgentActivity refreshAlerts={refreshAll} />}

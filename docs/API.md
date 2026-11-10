@@ -4,8 +4,15 @@ Base URL: `http://localhost:8000/api/v1`. Interactive documentation generated fr
 `http://localhost:8000/docs` (Swagger UI) and `/redoc`; this file adds the behaviour and examples.
 
 - All bodies are JSON. All timestamps are UTC, rendered like `2026-09-03T08:14:00Z`.
-- There is **no authentication**. Reviewer / actor names are free text supplied by the caller. Do not expose the API
-  to an untrusted network.
+- **Authentication is off by default** (`AUTH_MODE=disabled`, demo mode): reviewer / actor names are free text supplied by
+  the caller. With `AUTH_MODE=token`, every request needs `Authorization: Bearer <token>`, the role decides what the caller
+  may do, and the reviewer is the token's name. See [SECURITY.md](SECURITY.md).
+  - `401 Unauthorized`: no or unknown token. `403 Forbidden`: a known token whose role is too low.
+  - Roles: **viewer** (read), **analyst** (ingest, triage, enrich, close, seed, pipeline, correlate, investigate,
+    recommend, simulate), **approver** (approve, reject).
+  - `GET /auth/me` returns the caller's `mode`, `authenticated`, `name` and `role`.
+- **List totals.** `GET /alerts` and `GET /incidents` set the `X-Total-Count` header to the number of records matching the
+  filters (not just this page). The header is exposed to browsers through CORS.
 - Errors: `{"detail": "..."}` for 404 / 409 / 422 / 502. Unexpected server errors return HTTP 500 with a generic
   message; the details are in the server log only.
 
@@ -13,7 +20,8 @@ Base URL: `http://localhost:8000/api/v1`. Interactive documentation generated fr
 
 | Method | Path | Purpose |
 | --- | --- | --- |
-| GET | `/health` | Liveness, environment, database **engine** (never the connection string) |
+| GET | `/health` | Liveness, environment, database **engine** (never the connection string). Public (no token). |
+| GET | `/auth/me` | Who the caller is: mode, name and role |
 | GET | `/version` | Version and runtime information |
 | GET | `/config` | Non-secret runtime configuration (threat-intel mode, execution mode, authentication status) |
 | GET | `/stats` | True totals computed in the database (alerts by severity/status, incidents, awaiting review, audit count) |
@@ -34,7 +42,7 @@ Base URL: `http://localhost:8000/api/v1`. Interactive documentation generated fr
 | POST | `/incidents/{id}/simulate` | Rehearse an approved response (nothing is executed) |
 | POST | `/pipeline/run` | Run Triage → Enrichment → Correlation → Investigation → Response |
 | GET | `/pipeline/runs` | Recent run reports (`limit` 1-50, default 10) |
-| GET | `/agents` | Per-agent activity derived from the audit log |
+| GET | `/agents` | Per-agent activity derived from the audit log. `status` is `IDLE` (no activity recorded), `ACTIVE` (has acted) or `ATTENTION` (a failure is recorded). It is not a health guarantee. |
 | GET | `/audit-logs` | Audit entries, newest first. Query: `actor`, `action`, `target_id`, `limit` (1-200, default 50), `offset` |
 
 ## Alerts
@@ -215,6 +223,37 @@ Response (abridged):
   (`mode`: `mock` / `live` / `unavailable`, `requested_provider`, `active_provider`, `fallback_reason`,
   `live_provider_implemented: true`, `live_provider_active`, and a `virustotal` object with `api_key_configured`
   (yes/no only), the limits, `url_lookups: "disabled"` and the rolling `quota` when live mode is active), `llm` (`used_by_agents: false`),
-  `authentication` (`enabled: false`), the log source and sample-data paths. It contains no secrets.
+  `authentication` (`mode`, `enabled` = `AUTH_MODE` is `token`), the log source and sample-data paths. It contains no secrets
+  and never a token.
 - `GET /audit-logs` → `[{"id", "timestamp", "actor", "action", "target_id", "details"}]`, newest first; `action`
   filters are upper-cased.
+
+## Behaviour changes that clients should know about
+
+- **Timestamps.** A malformed `timestamp` is refused with `422` (`Invalid event timestamp: ...`). A missing timestamp is stored
+  as `null` and is never replaced by the current time. Timestamps with an offset are converted to UTC. Such an alert is not
+  time-correlated, and the correlation step reports it in `alerts_without_valid_timestamp`.
+- **Duplicates.** Re-ingesting an existing alert ID is `409`. Two requests racing for the same ID also end in one `201` and one `409`.
+  A duplicate upstream `external_alert_id` from the same source is `409`, checked by the application. The database enforces
+  only the alert ID, so an external-ID race can still store both (see the README limitations).
+- **Closing an alert.** `DELETE /alerts/{id}` sets `CLOSED`, keeps the record, and removes the alert from every active incident
+  that held it (`incidents_updated` in the response lists those incidents). An incident left with no alerts is `CLOSED`. Closed
+  alerts are never re-correlated, and triage or enrichment never re-opens them. Closed incidents are hidden from the default
+  incident list; ask for them with `?status=CLOSED`.
+- **Statuses only move forward.** Triage never moves an `ENRICHED` alert back to `TRIAGED`. Enrichment never moves a `CORRELATED`
+  alert back to `ENRICHED`.
+- **Correlation span.** A group never spans more than `window_hours` from its first alert to its last. A link that would stretch a
+  group past the window is refused. `POST /incidents/correlate` returns the refused links as `span_refusals` (the two alert IDs, the
+  shared fields, the span and a plain-language reason). Each incident's `details.correlation` carries `span_hours` and `window_hours`.
+- **Enrichment.** `normalized_data.enrichment.encoded_payloads` lists base64 payloads decoded from the command line
+  (`powershell -EncodedCommand`, `-enc`, `FromBase64String`). Each has `status` (`decoded`, `invalid_base64`, `not_text`
+  or `skipped`), the decoded text (up to 4096 characters, `truncated` says so), `executed: false` and a `provenance` note.
+  Indicators found in decoded text carry the source `decoded_command_line`. Unless `VIRUSTOTAL_LOOKUP_DECODED_INDICATORS` is
+  true, they are not sent to VirusTotal: `lookup_status` is `not_sent_decoded_disabled` and `lookup_summary.decoded_not_sent`
+  counts them. `GET /config` reports the setting as `threat_intel.virustotal.decoded_command_line_lookups`.
+- **Triage findings.** `normalized_data.triage.findings` lists each indicator as `{"type": "computed", "statement", "basis"}`. A
+  computed finding comes from rules applied to the alert's own fields. It is not threat intelligence.
+- **Mock intelligence.** A hash lookup returns `detection_ratio: null`: the mock has no vendor counts, so none is invented. Its
+  malicious hashes are synthetic labels (`MOCK sample: ...`) and do not match any real sample.
+- **Dashboard statistics.** `GET /stats` returns `alerts.open` (total minus closed), `incidents.closed`, and active-only incident
+  counts; merged incidents are not counted.

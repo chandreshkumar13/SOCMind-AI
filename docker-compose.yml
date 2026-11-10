@@ -1,3 +1,12 @@
+# LOCAL DEVELOPMENT AND DEMO ONLY.
+# This file starts the stack in demo mode: no authentication, and reviewer names are typed by the user. Ports are published on
+# 127.0.0.1 only, so the demo is not reachable from other machines. Do not run this file as a shared or production server.
+#
+# Production-like run (refuses demo mode):
+#   SOCMIND_ENVIRONMENT=production AUTH_MODE=token AUTH_TOKENS='[...]' docker compose up --build
+# The backend then refuses to start unless AUTH_TOKENS is valid. It never falls back to demo mode. Put real tokens in a
+# git-ignored file or the shell environment, never in this file. The frontend is a development server, so this file is
+# not a production deployment on its own.
 version: '3.8'
 
 services:
@@ -7,14 +16,20 @@ services:
       dockerfile: Dockerfile
     container_name: socmind_backend
     ports:
-      - "8000:8000"
+      - "127.0.0.1:8000:8000"
     environment:
-      - ENVIRONMENT=development
-      - DATABASE_URL=sqlite:///./socmind.db
+      # development (default) allows demo mode. Any other value needs AUTH_MODE=token (app/core/auth.py enforces this).
+      - ENVIRONMENT=${SOCMIND_ENVIRONMENT:-development}
+      # disabled (default) = demo mode, no token. token = every request needs a bearer token from AUTH_TOKENS.
+      - AUTH_MODE=${AUTH_MODE:-disabled}
+      - AUTH_TOKENS=${AUTH_TOKENS:-[]}
+      # SQLite database in the named volume socmind-db (created as user socmind, see backend/Dockerfile)
+      - DATABASE_URL=sqlite:////app/data/socmind.db
       - CORS_ORIGINS=["http://localhost:5173","http://localhost:3000"]
     volumes:
-      - ./backend:/app
-      - ./data:/data
+      # Read-only: the seed loader reads /data/sample_alerts (app/services/seed.py). The application never writes here.
+      - ./data:/data:ro
+      - socmind-db:/app/data
     restart: unless-stopped
 
   frontend:
@@ -23,9 +38,13 @@ services:
       dockerfile: Dockerfile
     container_name: socmind_frontend
     ports:
-      - "5173:5173"
+      - "127.0.0.1:5173:5173"
     environment:
       - VITE_API_BASE_URL=http://localhost:8000/api/v1
     depends_on:
       - backend
     restart: unless-stopped
+
+volumes:
+  # Survives `docker compose down`. `docker compose down -v` deletes the database.
+  socmind-db:

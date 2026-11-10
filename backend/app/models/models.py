@@ -1,5 +1,5 @@
 from datetime import datetime
-from sqlalchemy import Column, String, Integer, DateTime, Text, JSON, Boolean
+from sqlalchemy import Column, String, Integer, DateTime, Text, JSON
 from app.models.base import Base
 
 
@@ -8,7 +8,8 @@ class AlertModel(Base):
 
     id = Column(String, primary_key=True, index=True)
     external_alert_id = Column(String, index=True, nullable=True)
-    timestamp = Column(DateTime, default=datetime.utcnow)
+    # The event time, naive UTC. NULL means unknown: it has no default, so no time is ever invented for an alert.
+    timestamp = Column(DateTime, nullable=True)
     source = Column(String, index=True)
     alert_title = Column(String)
     description = Column(Text, nullable=True)

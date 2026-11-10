@@ -3,6 +3,7 @@ import ipaddress
 from datetime import datetime, timezone
 from typing import Dict, Any, List, Optional, Set, Tuple
 
+from app.agents.enrichment.encoded_commands import decode_command_line_payloads
 from app.tools.mock_intel import (
     query_mock_ip_reputation,
     query_mock_hash_reputation,
@@ -39,6 +40,8 @@ MD5_REGEX = re.compile(r'\b[a-fA-F0-9]{32}\b')
 SHA1_REGEX = re.compile(r'\b[a-fA-F0-9]{40}\b')
 SHA256_REGEX = re.compile(r'\b[a-fA-F0-9]{64}\b')
 URL_REGEX = re.compile(r'https?://[^\s<>"\'()]+')
+# Source label of indicators found inside decoded command-line payloads (kept apart from the original fields)
+DECODED_SOURCE = "decoded_command_line"
 DOMAIN_REGEX = re.compile(r'\b(?:[a-zA-Z0-9-]+\.)+[a-zA-Z]{2,}\b')
 
 
@@ -163,19 +166,7 @@ class EnrichmentAgent:
             if h_type:
                 add_ioc(h_str, h_type, "file_hash")
 
-        # 2. Inspect Free-Text Fields
-        text_sources = [
-            ("command_line", alert_data.get("command_line")),
-            ("alert_title", alert_data.get("alert_title") or alert_data.get("alert_name")),
-            ("description", alert_data.get("description"))
-        ]
-
-        for field_name, content in text_sources:
-            if not content or not isinstance(content, str):
-                continue
-
-            text = str(content)
-
+        def scan_text(text: str, field_name: str):
             # Extract URLs
             for url_match in URL_REGEX.findall(text):
                 add_ioc(url_match, "URL", field_name)
@@ -209,6 +200,23 @@ class EnrichmentAgent:
                 ext = dom_clean.split(".")[-1]
                 if ext not in NON_DOMAIN_EXTENSIONS and not self._is_valid_ip(dom_clean):
                     add_ioc(dom_clean, "DOMAIN", field_name)
+
+        # 2. Inspect Free-Text Fields
+        text_sources = [
+            ("command_line", alert_data.get("command_line")),
+            ("alert_title", alert_data.get("alert_title") or alert_data.get("alert_name")),
+            ("description", alert_data.get("description"))
+        ]
+
+        for field_name, content in text_sources:
+            if not content or not isinstance(content, str):
+                continue
+            scan_text(str(content), field_name)
+
+        # 3. Decoded command-line payloads (analysis only, see encoded_commands). Their indicators keep their own source label.
+        for payload in decode_command_line_payloads(alert_data.get("command_line")):
+            if payload.get("status") == "decoded":
+                scan_text(payload["decoded_text"], DECODED_SOURCE)
 
         return extracted
 

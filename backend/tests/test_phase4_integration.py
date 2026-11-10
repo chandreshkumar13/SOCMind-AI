@@ -87,7 +87,8 @@ def test_correlation_is_deterministic_and_keeps_unrelated_groups_apart():
 def test_two_shared_strong_entities_give_high_confidence():
     g = CorrelationAgent().correlate_alerts([A("a", "2026-09-03T08:00:00Z", host="H", file_hash="ab" * 16),
                                              A("b", "2026-09-03T08:05:00Z", host="h", file_hash="AB" * 16)])
-    assert g[0]["confidence"] == "high" and len(g[0]["reasons"]) == 2
+    shared_reasons = [r for r in g[0]["reasons"] if " share " in r]     # the span explanation (C12) is a separate reason
+    assert g[0]["confidence"] == "high" and len(shared_reasons) == 2
 
 
 # ------------------------------------------------------------------ persistence, concurrency, migration

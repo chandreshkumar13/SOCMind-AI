@@ -1,0 +1,14 @@
+# Keep secrets, databases, local artefacts and tests out of the image build context
+.env
+.env.*
+*.db
+*.sqlite3
+*.bak
+*.patch
+*.txt.bak
+__pycache__/
+*.py[cod]
+.pytest_cache/
+tests/
+verify_preservation.py
+.git/

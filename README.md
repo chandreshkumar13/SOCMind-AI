@@ -56,7 +56,7 @@ docs/            ARCHITECTURE.md, API.md, KALPNA_FEATURE_RESERVATION.md
 ## Prerequisites
 
 - Python 3.11 or newer (developed and tested with 3.14) and `pip`
-- Node.js 18 or newer (tested with 24) and `npm`
+- Node.js 22 or newer (tested with 24; the Docker image uses `node:24-alpine`) and `npm`
 - Optional: Docker (see below; **not exercised** during the latest verification)
 
 ## Run it locally
@@ -100,14 +100,45 @@ Or from the command line: `curl -X POST localhost:8000/api/v1/alerts/seed` then 
 
 ### Docker (provided, unverified)
 
-`docker compose up --build` is configured (`docker-compose.yml`, `backend/Dockerfile`, `frontend/Dockerfile`; the frontend
-image runs the Vite dev server). It was **not** run during the latest verification, so treat it as untested.
+`docker compose up --build` starts a **local development and demo** stack (`docker-compose.yml`). It runs in demo mode with
+no authentication, publishes its ports on `127.0.0.1` only, and keeps the SQLite database in the named volume `socmind-db`
+(`docker compose down` keeps it; `docker compose down -v` deletes it). The backend container runs as the non-root user
+`socmind`, and the frontend container runs the Vite dev server as the non-root user `node`. The frontend image uses Node 24,
+because Node 18 is end-of-life.
+
+The backend image sets `ENVIRONMENT=production`, and Compose lets you choose the environment explicitly. A production-like run
+refuses demo mode:
+
+```
+SOCMIND_ENVIRONMENT=production AUTH_MODE=token AUTH_TOKENS='[...]' docker compose up --build
+```
+
+Without `AUTH_MODE=token` and valid tokens, the backend exits at startup. Keep real tokens out of Git. The frontend is a
+development server, so this Compose file is not a production deployment on its own.
+
+**Not verified:** Docker is not installed in the environment where these files were written, so no image has been built or run.
 
 ## Configuration
 
 Copy [`.env.example`](.env.example) to `backend/.env`. Every variable is optional. Only variables the code reads are listed:
 `PROJECT_NAME`, `ENVIRONMENT`, `DEBUG`, `LOG_LEVEL`, `DATABASE_URL`, `CORS_ORIGINS`, `THREAT_INTEL_MOCK_MODE`,
-`THREAT_INTEL_PROVIDER` and the `VIRUSTOTAL_*` settings described below. Never commit a real `.env` (it is in `.gitignore`).
+`THREAT_INTEL_PROVIDER`, `AUTH_MODE`, `AUTH_TOKENS` and the `VIRUSTOTAL_*` settings described below. Never commit a real
+`.env` (it is in `.gitignore`).
+
+### Authentication
+
+`AUTH_MODE=disabled` (the default) is a **demo mode with no authentication**: every action is allowed and reviewer names are
+typed by the user. `AUTH_MODE=token` requires `Authorization: Bearer <token>` and gives each token a role (viewer,
+analyst or approver), and the reviewer recorded on a decision is the token's name. The API refuses to start when token mode
+has no valid tokens, and it refuses demo mode (`AUTH_MODE=disabled`) outside `ENVIRONMENT=development` or `test`. Roles, status codes and the token rules are in [docs/SECURITY.md](docs/SECURITY.md).
+
+```
+AUTH_MODE=token
+AUTH_TOKENS=[{"name": "Ana Analyst", "role": "analyst", "token": "<at least 16 random characters>"}]
+```
+
+Settings has an *Access* card where a token can be entered for the browser tab (kept in `sessionStorage`, cleared when
+the tab closes).
 
 ### Threat intelligence
 
@@ -136,6 +167,10 @@ loopback, link-local, reserved and other non-public IP addresses are **never** s
 in this version), invalid or internal-looking domains (`.local`, `.internal`, file names such as `install.sh`), or
 values that are not valid indicators. Indicators you do send are visible to VirusTotal: do not enable live mode for
 data you may not disclose.
+
+**Decoded command lines.** Indicators found inside base64 payloads of PowerShell command lines are **not sent** to VirusTotal
+unless you set `VIRUSTOTAL_LOOKUP_DECODED_INDICATORS=true`. Without it they are reported as `not_sent_decoded_disabled`.
+Turning it on sends values that were hidden inside encoded commands, so do so only if you accept that disclosure.
 
 **Quota, honestly.** The public API allows **4 requests per minute and 500 per day** and may only be used for
 **non-commercial** purposes (VirusTotal's terms). SOCMind AI never waits for quota inside a request. It spends at most
@@ -180,17 +215,17 @@ The backend tests always run on a **throw-away database in the system temp direc
 opened (`tests/test_db_isolation.py` proves it). The integration test needs Python with `backend/requirements.txt`
 installed (`PYTHON=python3 npm run test:integration` selects another interpreter).
 
-**Latest verification (2026-10-22, Windows, Python 3.14.4, Node 24.15.0):**
+**Latest verification (2026-11-10, Windows, Python 3.14, Node 24):**
 
 | Command | Result |
 | --- | --- |
-| `python -m pytest` (backend) | **178 passed**, 0 failed (includes the 44 enrichment tests, unchanged) |
-| `npm test` (frontend) | **11 passed**, 0 failed |
+| `python -m pytest tests -q` (backend) | **514 passed**, 0 failed |
+| `npm test -- --run` (frontend unit tests) | **76 passed**, 0 failed |
 | `npm run build` | succeeds |
-| `npm run test:integration` | **39 checks passed** against a live backend |
+| `npm run test:integration` | **92 checks passed** against a live backend on a temporary database |
 
-Not covered: no browser was driven (the integration test renders pages server-side from live API data, so clicks,
-layout and styling are unverified); Docker; PostgreSQL; and no linter or type checker is configured in this project.
+Not covered: no browser was driven (the integration test renders pages server-side from live API data, so clicks, layout and styling are
+unverified); the Docker images were never built or run (Docker is not installed here); PostgreSQL; and no linter or type checker is configured in this project.
 
 ## Troubleshooting
 
@@ -201,6 +236,13 @@ layout and styling are unverified); Docker; PostgreSQL; and no linter or type ch
 - **"Load sample alerts" does nothing new**: the sample load is idempotent; the 10 sample alerts already exist.
 - **Alerts show but there are no incidents**: run the pipeline (or "Correlate only"). At least two alerts must share a
   host, IP or file hash within the time window (default 24 h).
+- **`401 Unauthorized`**: token mode is on and the request has no valid bearer token. Enter it in Settings → Access, or send
+  `Authorization: Bearer <token>`. The message never shows the token.
+- **`403 Forbidden`**: the token is valid but its role is too low for the action (for example an analyst approving). Ask an
+  approver, or use a token with the right role.
+- **Backend refuses to start with "AUTH_MODE is 'token' but ..."**: fix `AUTH_TOKENS` (at least one entry, a role of viewer,
+  analyst or approver, and a token of 16 or more characters).
+- **Alert list shows "Showing N of M"**: only part of the list is loaded. Press *Load more*; the search still covers every alert.
 - **`409` when approving or simulating**: a decision may already exist, the recommendations may be out of date because
   a new alert joined the incident (regenerate them first), or someone decided at the same moment. The message says which.
 - **Pipeline `409 ... already in progress`**: another run is still going; wait and retry.
@@ -209,14 +251,23 @@ layout and styling are unverified); Docker; PostgreSQL; and no linter or type ch
 
 ## Security limitations
 
-- **No authentication or authorization.** Anyone who can reach the API can approve, reject, simulate or run the pipeline.
-  Reviewer names are self-asserted free text. Run it only on a trusted local network and do not expose it publicly.
-- Adding authentication was deliberately left out of scope; the approval workflow would need real identities first.
-- Threat intelligence is mock data unless you enable VirusTotal; live verdicts are third-party opinions and can be wrong. Investigation logs are a bundled sample file.
+The full model is in [docs/SECURITY.md](docs/SECURITY.md). In short:
+
+- **Demo mode (`AUTH_MODE=disabled`, the default) has no authentication.** Anyone who can reach the API can approve,
+  reject, simulate or run the pipeline. Run it only on a trusted local network.
+- **Token mode is basic.** Tokens are static: no login, no expiry, and revocation needs a restart. It has not been tested
+  against a real identity provider, and traffic is not encrypted by the application (put HTTPS in front of it).
+- Threat intelligence is mock data unless you enable VirusTotal; live verdicts are third-party opinions and can be wrong.
+  The investigation logs are a bundled sample file.
 - There is no real response integration; "simulated" means a record was written, nothing else.
 - `CORS_ORIGINS` allows credentials; keep the list to origins you control.
-- The pipeline run lock is per process (several server workers would not share it).
-- Input length limits exist, but there is no rate limiting.
+- **Process-local state.** The pipeline run lock, the VirusTotal quota counters and the lookup cache live in one process.
+  Several server workers would each have their own, so quotas and locks would not be shared. Run one worker process; the
+  backend logs a warning when `WEB_CONCURRENCY` is above 1.
+- **No database-level uniqueness for external alert IDs.** Duplicate upstream alerts are refused by an application check;
+  only the internal alert ID is protected by the database. Adding a unique index needs a schema change.
+- No rate limiting on the API.
+- The Docker files are written but **have not been built or run** (Docker was not available). See the Docker section.
 
 ## Roadmap
 

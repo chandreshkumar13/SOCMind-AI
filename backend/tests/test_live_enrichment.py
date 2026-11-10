@@ -231,10 +231,39 @@ def test_pipeline_reports_partial_enrichment_then_completes_it_on_later_runs(iso
     clock.advance(61)
     second = iso_client.post("/api/v1/pipeline/run").json()
     assert second["alerts_with_incomplete_enrichment"] == 0 and second["outcome"] == "success" and second["warnings"] == []
-    assert len(server.requests) == 7                              # 2 public IPs + 5 hashes, each asked about exactly once
+    # 2 public IPs + 5 hashes, each asked about exactly once. The domain that is only visible once the base64 PowerShell
+    # command in ALT-2026-001 is decoded (malicious-domain.net) is NOT sent: decoded indicators are off by default.
+    assert len(server.requests) == 7
+    assert not any("malicious-domain.net" in str(r.url) for r in server.requests)
 
     third = iso_client.post("/api/v1/pipeline/run").json()
     assert third["outcome"] == "success" and all(s["processed"] == 0 for s in third["stages"]) and len(server.requests) == 7
+
+
+# ------------------------------------------------------------------ decoded indicators (disclosure control)
+def test_decoded_indicators_are_not_sent_to_virustotal_by_default(iso_client, live):
+    server, _ = live()
+    iso_client.post("/api/v1/alerts/seed")
+    enr, _ = enrich(iso_client, "ALT-2026-001")
+    decoded = [i for i in enr["iocs"] if i["value"] == "malicious-domain.net"]
+    assert decoded and decoded[0]["source"] == "decoded_command_line"
+    assert decoded[0]["lookup_status"] == "not_sent_decoded_disabled" and decoded[0]["reputation"] == "UNKNOWN"
+    assert "VIRUSTOTAL_LOOKUP_DECODED_INDICATORS" in decoded[0]["evidence"]
+    assert enr["lookup_summary"]["decoded_not_sent"] >= 1
+    assert not any("malicious-domain.net" in str(r.url) for r in server.requests)
+    assert iso_client.get("/api/v1/config").json()["threat_intel"]["virustotal"]["decoded_command_line_lookups"] is False
+
+
+def test_decoded_indicators_are_sent_only_after_the_operator_opts_in(iso_client, live):
+    server, _ = live(VIRUSTOTAL_LOOKUP_DECODED_INDICATORS=True, VIRUSTOTAL_REQUESTS_PER_MINUTE=100,
+                     VIRUSTOTAL_MAX_LOOKUPS_PER_ALERT=50)
+    iso_client.post("/api/v1/alerts/seed")
+    enr, _ = enrich(iso_client, "ALT-2026-001")
+    decoded = [i for i in enr["iocs"] if i["value"] == "malicious-domain.net"]
+    assert decoded and decoded[0]["lookup_status"] == "completed"
+    assert any("malicious-domain.net" in str(r.url) for r in server.requests)
+    assert enr["lookup_summary"]["decoded_not_sent"] == 0
+    assert iso_client.get("/api/v1/config").json()["threat_intel"]["virustotal"]["decoded_command_line_lookups"] is True
 
 
 def test_live_findings_are_attributed_to_virustotal_and_never_called_mock(iso_client, live):

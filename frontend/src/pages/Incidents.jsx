@@ -6,7 +6,7 @@ import StaleNotice from '../components/StaleNotice';
 import { ActionButton, EmptyCard, ErrorCard, LoadingCard } from '../components/StateCards';
 import { api } from '../api';
 import useAsync from '../lib/useAsync';
-import { formatUtc, groupFindings, recommendationView, reinvestigationNotice, reviewState, safeVirusTotalUrl, simulationState, statusLabel } from '../lib/view';
+import { closedNotice, computedFindingsByAlert, formatUtc, groupFindings, loadMoreNote, recommendationView, reinvestigationNotice, reviewState, safeVirusTotalUrl, simulationState, statusLabel } from '../lib/view';
 import {
   APPROVAL_FILTERS, DEFAULT_CRITERIA, SEVERITY_ORDER, SORT_OPTIONS, STATUS_FILTERS,
   filterAndSortIncidents, isDefaultView, shownSummary,
@@ -63,6 +63,44 @@ export function CorrelatedAlerts({ alerts }) {
           </tbody>
         </table>
       </div>
+    </div>
+  );
+}
+
+// Computed findings: rules applied to each alert's own fields by triage. Shown apart from verified facts and threat intelligence.
+export function ComputedFindings({ alerts }) {
+  const rows = computedFindingsByAlert(alerts);
+  if (rows.length === 0) return null;
+  return (
+    <div style={{ ...panel, borderColor: 'rgba(148, 163, 184, 0.4)' }}>
+      <div style={sectionTitle}>Computed findings ({rows.reduce((n, r) => n + r.statements.length, 0)})</div>
+      <div style={{ ...muted, marginBottom: '6px' }}>
+        Deterministic rules applied to each alert's own fields. They are not threat intelligence and not verified facts.
+      </div>
+      {rows.map((row) => (
+        <div key={row.id} style={{ fontSize: '13px', padding: '4px 0' }}>
+          <span className="code-font">{row.id}</span> <span style={muted}>{row.title}</span>
+          <ul style={{ margin: '4px 0 0 18px' }}>
+            {row.statements.map((st, i) => <li key={i}>{st}</li>)}
+          </ul>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+// Closed alerts: a fully closed incident is read-only, and a partly closed one says which alerts left it.
+export function ClosedNotice({ incident }) {
+  const notice = closedNotice(incident);
+  if (!notice) return null;
+  const closedStyle = { ...panel, borderColor: 'rgba(148, 163, 184, 0.5)' };
+  return (
+    <div style={closedStyle}>
+      <div style={sectionTitle}>{notice.level === 'closed' ? 'Closed incident' : 'Closed alerts removed from this incident'}</div>
+      <div style={{ fontSize: '13px' }}>{notice.text}</div>
+      {notice.alertIds.length > 0 && (
+        <div style={{ ...muted, marginTop: '6px' }}>Closed alerts: <span className="code-font">{notice.alertIds.join(', ')}</span></div>
+      )}
     </div>
   );
 }
@@ -341,21 +379,24 @@ function IncidentDetail({ id, onChanged }) {
   if (loading && !inc) return <LoadingCard>Loading incident {id}...</LoadingCard>;
   if (error && !inc) return <ErrorCard title="Could not load incident" message={error} onRetry={reload} />;
   const details = inc.details || {};
+  const closed = inc.status === 'CLOSED';
   return (
     <div style={{ marginTop: '14px' }}>
       {actionError && <ErrorCard title="Action not completed" message={actionError} />}
+      <ClosedNotice incident={inc} />
       <StaleNotice details={details} />
       <div style={{ display: 'flex', gap: '10px', marginBottom: '14px', flexWrap: 'wrap' }}>
-        <ActionButton variant="ghost" busy={busy} title={reinvestigationNotice(inc) || ''}
+        <ActionButton variant="ghost" busy={busy} disabled={closed} title={closed ? 'This incident is closed' : (reinvestigationNotice(inc) || '')}
           onClick={() => (reinvestigationNotice(inc) ? setConfirming(true) : reinvestigate())}>Re-run investigation</ActionButton>
-        <ActionButton variant="ghost" busy={busy} disabled={inc.human_approval_status !== 'PENDING'}
-          title={inc.human_approval_status !== 'PENDING' ? 'A decision is recorded; recommendations are locked' : ''}
+        <ActionButton variant="ghost" busy={busy} disabled={closed || inc.human_approval_status !== 'PENDING'}
+          title={closed ? 'This incident is closed' : (inc.human_approval_status !== 'PENDING' ? 'A decision is recorded; recommendations are locked' : '')}
           onClick={() => act(() => api(`/incidents/${id}/recommend`, { method: 'POST' }))}>Generate recommendations</ActionButton>
       </div>
       <ReinvestigateConfirm notice={confirming ? reinvestigationNotice(inc) : null} busy={busy}
         onConfirm={() => { setConfirming(false); reinvestigate(); }} onCancel={() => setConfirming(false)} />
       <Correlation correlation={details.correlation} />
       <CorrelatedAlerts alerts={inc.alerts || []} />
+      <ComputedFindings alerts={inc.alerts || []} />
       <Investigation inv={details.investigation} />
       <Recommendations details={details} />
       <Review incident={inc} busy={busy}
@@ -367,7 +408,7 @@ function IncidentDetail({ id, onChanged }) {
   );
 }
 
-export default function Incidents({ incidents, loading, error, refresh, refreshAlerts }) {
+export default function Incidents({ incidents, loading, error, refresh, refreshAlerts, incidentsTotal, loadMoreIncidents, loadingMore }) {
   const [openId, setOpenId] = useState(null);
   const [busy, setBusy] = useState(false);
   const [notice, setNotice] = useState(null);
@@ -415,6 +456,17 @@ export default function Incidents({ incidents, loading, error, refresh, refreshA
           <ActionButton variant="ghost" onClick={refresh}><RefreshCw size={12} style={{ verticalAlign: '-2px' }} /> Refresh</ActionButton>
         </div>
       </div>
+
+      {loadMoreNote(visible.length, incidentsTotal, 'incidents') && (
+        <div style={{ display: 'flex', gap: '10px', alignItems: 'center', flexWrap: 'wrap', fontSize: '12px', color: '#fde047', marginBottom: '12px' }}>
+          <span>{loadMoreNote(visible.length, incidentsTotal, 'incidents')} The filters and sort below apply to the loaded incidents.</span>
+          {loadMoreIncidents && (
+            <button onClick={loadMoreIncidents} disabled={loadingMore} style={{ padding: '4px 10px', borderRadius: 'var(--radius-sm)', border: '1px solid var(--border-color)', background: 'rgba(255,255,255,0.05)', color: 'var(--accent-cyan)', fontSize: '12px', cursor: loadingMore ? 'wait' : 'pointer' }}>
+              {loadingMore ? 'Loading...' : 'Load more'}
+            </button>
+          )}
+        </div>
+      )}
 
       {visible.length > 0 && (
         <div className="glass-card" style={{ marginBottom: '12px', display: 'flex', gap: '12px', alignItems: 'center', flexWrap: 'wrap' }}>

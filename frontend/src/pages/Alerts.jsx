@@ -2,7 +2,7 @@ import React, { useEffect, useRef, useState } from 'react';
 import { Filter, Search, PlusCircle, RefreshCw, AlertTriangle } from 'lucide-react';
 import StatusBadge from '../components/StatusBadge';
 import { api } from '../api';
-import { alertSearchPath, detectionLabel, enrichmentNotices, fetchAlertSearch, formatUtc, intelSource, isRetryableLookup, lookupStatusLabel, refreshedSelection, reputationKey, reputationSource, safeVirusTotalUrl, searchCapNote, truncationNote } from '../lib/view';
+import { alertSearchPath, detectionLabel, enrichmentNotices, fetchAlertSearch, formatUtc, intelSource, isRetryableLookup, loadMoreNote, lookupStatusLabel, refreshedSelection, reputationKey, reputationSource, safeVirusTotalUrl, searchCapNote } from '../lib/view';
 
 // Where the reputations came from, as stored on the record. Live results are blue and name their provider;
 // everything else keeps the amber "unverified" tint.
@@ -43,6 +43,7 @@ export function AnalysisPanels({ alert, busy, onRun, runError }) {
         {triage && (
           <div style={{ fontSize: '12px', marginTop: '4px' }}>
             Score <strong>{triage.suspicion_score}/100</strong> · priority <StatusBadge severity={triage.priority} />
+            <div style={{ ...small, marginTop: '4px' }}>Computed findings: rules applied to this alert's own fields, not threat intelligence.</div>
             <ul style={{ margin: '6px 0 0 16px' }}>
               {(triage.indicators || []).map((i, k) => <li key={k}>{i}</li>)}
               {(triage.indicators || []).length === 0 && <li style={small}>No additional risk indicators.</li>}
@@ -68,6 +69,19 @@ export function AnalysisPanels({ alert, busy, onRun, runError }) {
             )}
             {source && <div style={{ ...small, color: '#fde047', marginTop: '4px' }}>{source.disclaimer}</div>}
             {enrichmentNotices(enr).map((note, k) => <div key={k} style={{ ...small, color: '#fb923c', marginTop: '4px' }}>{note}</div>)}
+            {(enr.encoded_payloads || []).map((p, k) => (
+              <div key={k} style={{ marginTop: '8px', padding: '8px', border: '1px solid var(--border-color)', borderRadius: 'var(--radius-sm)' }}>
+                <div style={{ fontSize: '12px', fontWeight: 600 }}>
+                  Encoded command ({p.kind === 'from_base64_string' ? 'FromBase64String' : 'PowerShell -EncodedCommand'}): {p.status === 'decoded' ? `decoded ${p.encoding}` : p.reason}
+                </div>
+                <div style={{ ...small, color: '#fde047', marginTop: '2px' }}>{p.provenance}</div>
+                {p.status === 'decoded' && (
+                  <pre style={{ ...small, whiteSpace: 'pre-wrap', wordBreak: 'break-all', marginTop: '4px', color: 'var(--text-main)' }}>
+                    {p.decoded_text}{p.truncated ? ' …(truncated)' : ''}
+                  </pre>
+                )}
+              </div>
+            ))}
             {enr.iocs.length > 0 && (
               <table className="cyber-table" style={{ marginTop: '6px' }}>
                 <thead>
@@ -121,7 +135,7 @@ export function alertMatchesSearch(alert, searchQuery) {
 // Pause after the last keystroke before asking the server, so typing does not send a request per character.
 const SEARCH_DEBOUNCE_MS = 250;
 
-export default function Alerts({ alerts, loading, error, refreshAlerts, seedSampleAlerts, totalAlerts }) {
+export default function Alerts({ alerts, loading, error, refreshAlerts, seedSampleAlerts, totalAlerts, alertsTotal, loadMoreAlerts, loadingMore }) {
   const [analysisBusy, setAnalysisBusy] = useState(false);
   const [analysisError, setAnalysisError] = useState(null);
   const [filterSeverity, setFilterSeverity] = useState('ALL');
@@ -132,6 +146,7 @@ export default function Alerts({ alerts, loading, error, refreshAlerts, seedSamp
   const [searchResult, setSearchResult] = useState(null);   // { term, rows } from GET /alerts?search=
   const [searching, setSearching] = useState(false);
   const [searchError, setSearchError] = useState(null);
+  const [ingestError, setIngestError] = useState(null);     // shown inline instead of a blocking alert()
   const searchSequence = useRef(0);   // a response from an older search run is ignored
 
   // The drawer holds its own copy of the alert. Keep it in step with the list the page loads, so a result stored
@@ -192,6 +207,7 @@ export default function Alerts({ alerts, loading, error, refreshAlerts, seedSamp
   // Handle Ingesting Synthetic Test Alert via POST /api/v1/alerts
   const handleIngestTestAlert = async () => {
     setIngesting(true);
+    setIngestError(null);
     const syntheticPayload = {
       alert_title: "Synthetic Test Ingestion: Unrecognized Admin CLI Script Execution",
       source: "CrowdStrike EDR",
@@ -208,7 +224,7 @@ export default function Alerts({ alerts, loading, error, refreshAlerts, seedSamp
       await api('/alerts', { method: 'POST', body: syntheticPayload });
       await refreshAlerts();
     } catch (err) {
-      alert(`Error ingesting test alert: ${err.message}`);
+      setIngestError(`Error ingesting test alert: ${err.message}`);
     } finally {
       setIngesting(false);
     }
@@ -320,6 +336,10 @@ export default function Alerts({ alerts, loading, error, refreshAlerts, seedSamp
         </div>
       </div>
 
+      {ingestError && (
+        <div role="alert" style={{ fontSize: '12px', color: '#f87171', marginBottom: '10px' }}>{ingestError}</div>
+      )}
+
       {/* Loading State */}
       {loading && (
         <div className="glass-card" style={{ padding: '40px', textAlign: 'center', color: 'var(--text-muted)' }}>
@@ -337,7 +357,7 @@ export default function Alerts({ alerts, loading, error, refreshAlerts, seedSamp
             Backend Connection Notice
           </div>
           <p style={{ color: 'var(--text-muted)', fontSize: '13px', marginTop: '6px' }}>
-            {error}. Check that the FastAPI backend server is running at <code>http://localhost:8000</code>.
+            {error}. Check that the backend server is running and reachable from this page.
           </p>
           <button 
             onClick={refreshAlerts} 
@@ -348,9 +368,14 @@ export default function Alerts({ alerts, loading, error, refreshAlerts, seedSamp
         </div>
       )}
 
-      {!loading && !searchActive && truncationNote(alerts.length, totalAlerts) && (
-        <div style={{ fontSize: '12px', color: '#fde047', marginBottom: '10px' }}>
-          {truncationNote(alerts.length, totalAlerts)} Filters apply to the loaded alerts only.
+      {!loading && !searchActive && loadMoreNote(alerts.length, alertsTotal, 'alerts') && (
+        <div style={{ display: 'flex', gap: '10px', alignItems: 'center', flexWrap: 'wrap', fontSize: '12px', color: '#fde047', marginBottom: '10px' }}>
+          <span>{loadMoreNote(alerts.length, alertsTotal, 'alerts')} The severity filter applies to the loaded alerts; search covers every alert.</span>
+          {loadMoreAlerts && (
+            <button onClick={loadMoreAlerts} disabled={loadingMore} style={{ padding: '4px 10px', borderRadius: 'var(--radius-sm)', border: '1px solid var(--border-color)', background: 'rgba(255,255,255,0.05)', color: 'var(--accent-cyan)', fontSize: '12px', cursor: loadingMore ? 'wait' : 'pointer' }}>
+              {loadingMore ? 'Loading...' : 'Load more'}
+            </button>
+          )}
         </div>
       )}
 
@@ -403,7 +428,7 @@ export default function Alerts({ alerts, loading, error, refreshAlerts, seedSamp
                     >
                       <td className="code-font">{a.id}</td>
                       <td style={{ fontSize: '12px', color: 'var(--text-muted)' }}>
-                        {new Date(a.timestamp).toLocaleTimeString()}
+                        {formatUtc(a.timestamp)}
                       </td>
                       <td style={{ fontWeight: 600 }}>{a.alert_title || a.alert_name}</td>
                       <td style={{ fontSize: '12px' }}>{a.source || a.source_system}</td>

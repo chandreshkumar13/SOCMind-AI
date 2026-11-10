@@ -1,5 +1,4 @@
-import os
-from typing import List, Optional
+from typing import Any, List, Optional
 from pydantic import SecretStr
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
@@ -44,6 +43,17 @@ class Settings(BaseSettings):
     VIRUSTOTAL_REQUESTS_PER_MINUTE: int = 4            # public API quota
     VIRUSTOTAL_REQUESTS_PER_DAY: int = 500             # public API quota
     VIRUSTOTAL_CACHE_TTL_SECONDS: int = 86400          # in-memory cache of completed lookups
+    # Indicators decoded from base64 in a PowerShell command line are sent to VirusTotal ONLY when this is true. They are
+    # read from the command line itself, so the default keeps them local. Mock lookups are never affected.
+    VIRUSTOTAL_LOOKUP_DECODED_INDICATORS: bool = False
+
+    # Authentication. "disabled" (default, demo): no token, all actions allowed, reviewer names self-asserted.
+    # "token": every request needs a bearer token from AUTH_TOKENS, a list of {"name", "role", "token"} objects where the
+    # role is viewer, analyst or approver. Set AUTH_TOKENS as JSON in the environment; never commit real tokens.
+    AUTH_MODE: str = "disabled"
+    # Typed as a plain list on purpose: Pydantic would echo a bad value (possibly a token) in its error. The shape is checked by
+    # validate_auth_config instead, whose messages never include a value.
+    AUTH_TOKENS: List[Any] = []
 
     # Logging
     LOG_LEVEL: str = "INFO"

@@ -208,3 +208,37 @@ Pages: Dashboard, Security Alerts, Correlated Incidents, Agent Pipeline, Audit L
 `GET /config`). Pure helpers live in `src/lib/view.js` (unit tested); `src/lib/useAsync.js` provides loading / error /
 data state. Every list has loading, error and empty states. Sample data is only loaded when the analyst presses
 "Load sample (synthetic) alerts".
+
+## Recent modules and where they sit
+
+| Module | Role |
+| --- | --- |
+| `app/core/auth.py` | Bearer-token check, roles (viewer < analyst < approver), startup validation of the token configuration |
+| `app/core/clock.py` | The one clock for stored timestamps (naive UTC, through the timezone-aware API) |
+| `app/agents/text_match.py` | Whole-term keyword matching shared by triage, investigation and response (`c2` does not match `ec2`) |
+| `app/agents/enrichment/encoded_commands.py` | Read-only decoding of base64 PowerShell payloads; never executes |
+| `app/services/incident_state.py` | Merged and closed rules: what counts as an active incident |
+| `app/services/staleness.py` (`detach_closed_alert`) | Removes a closed alert from its incidents in the same transaction as the close |
+
+Lists (`/alerts`, `/incidents`) are paginated with `X-Total-Count` for the matching total. Sort orders end with the ID, so pages are
+stable. Each alert status only moves forward (NEW, TRIAGED, ENRICHED, CORRELATED, INVESTIGATING, CLOSED).
+
+## Process-local state and other limits
+
+These are real limits of the current design. None is hidden by the API.
+
+- **Pipeline run lock.** `_RUN_LOCK` (`app/services/orchestrator.py`) is per process. Two server workers would each allow a run,
+  so the application must run as **one** worker process. The `409 pipeline already in progress` guarantee holds only inside one process.
+- **VirusTotal client.** The quota counters, result cache and circuit breaker (`services/threat_intel.get_client`) are per process.
+  With N workers the effective request budget can be up to N times the configured one. A startup warning is logged when
+  `WEB_CONCURRENCY` is above 1 (`app/core/runtime.py`). The Docker image starts a single worker.
+- **VirusTotal quota, cache and circuit breaker** (`app/tools/virustotal.py`) live in memory. They reset on restart and are not
+  shared between processes. Each process applies its own per-minute and per-day quota.
+- **Database uniqueness.** The alert ID is the primary key, so the database rejects a duplicate ID. The external alert ID
+  (`source` + `external_alert_id`) has **no unique index**: the uniqueness check is in the application. Adding the index is a
+  schema change and was not made.
+- **Schema changes.** `Base.metadata.create_all` creates tables. The one additive upgrade step in `app/db/session.py` adds a
+  missing column. Renames, drops and type changes need a migration tool, which is not included.
+- **Docker.** The images are written but unverified (see the README).
+- **Mock data.** The mock intelligence dataset and the sample alerts are synthetic. The sample alerts use public addresses, so
+  live verdicts on them are not meaningful.

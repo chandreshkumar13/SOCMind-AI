@@ -7,7 +7,7 @@ from sqlalchemy.orm import Session
 from app.core.config import EXECUTION_MODE, settings
 from app.db.session import get_db
 from app.models.models import AlertModel, AuditLogModel, IncidentModel
-from app.services.incident_state import active_incidents_clause
+from app.services.incident_state import CLOSED, active_incidents_clause, not_merged_clause
 from app.services.log_store import LOG_SOURCE_PATH
 from app.services.threat_intel import api_key_configured, quota_snapshot, resolve_provider
 
@@ -29,12 +29,16 @@ def stats(db: Session = Depends(get_db)) -> Dict[str, Any]:
     incident_status = _counts(db, IncidentModel.status, active)
     awaiting = (db.query(func.count(IncidentModel.id))
                 .filter(active, IncidentModel.status == "RESPONSE_PROPOSED", IncidentModel.human_approval_status == "PENDING").scalar() or 0)
+    closed_incidents = (db.query(func.count(IncidentModel.id))
+                        .filter(not_merged_clause(), IncidentModel.status == CLOSED).scalar() or 0)
+    alert_status = _counts(db, AlertModel.status)
+    alerts_total = db.query(func.count(AlertModel.id)).scalar() or 0
     return {
-        "alerts": {"total": db.query(func.count(AlertModel.id)).scalar() or 0,
-                   "by_severity": _counts(db, AlertModel.severity), "by_status": _counts(db, AlertModel.status)},
+        "alerts": {"total": alerts_total, "open": alerts_total - alert_status.get("CLOSED", 0),
+                   "by_severity": _counts(db, AlertModel.severity), "by_status": alert_status},
         "incidents": {"total": sum(incident_status.values()), "by_status": incident_status,
                       "by_severity": _counts(db, IncidentModel.severity, active),
-                      "awaiting_human_review": awaiting},
+                      "awaiting_human_review": awaiting, "closed": closed_incidents},
         "audit_entries": db.query(func.count(AuditLogModel.id)).scalar() or 0,
     }
 
@@ -64,6 +68,7 @@ def runtime_config() -> Dict[str, Any]:
                 "timeout_seconds": settings.VIRUSTOTAL_TIMEOUT_SECONDS,
                 "cache_ttl_seconds": settings.VIRUSTOTAL_CACHE_TTL_SECONDS,
                 "url_lookups": "disabled",
+                "decoded_command_line_lookups": bool(settings.VIRUSTOTAL_LOOKUP_DECODED_INDICATORS),
                 "quota": quota_snapshot(),
             },
             "note": {
@@ -74,8 +79,13 @@ def runtime_config() -> Dict[str, Any]:
         },
         "llm": {"configured_provider": settings.LLM_PROVIDER, "used_by_agents": False,
                 "note": "All five agents are deterministic rule-based code; no LLM is called."},
-        "authentication": {"enabled": False,
-                           "note": "The API has no authentication. Reviewer names are self-asserted. Do not expose it to untrusted networks."},
+        "authentication": {
+            "mode": settings.AUTH_MODE,
+            "enabled": settings.AUTH_MODE == "token",
+            "note": ("Token mode: every request needs a bearer token; roles are viewer, analyst and approver, and the reviewer is the token's name."
+                     if settings.AUTH_MODE == "token" else
+                     "Demo mode: no authentication. Reviewer names are self-asserted. Do not expose it to untrusted networks."),
+        },
         "investigation_log_source": {"type": "synthetic_sample_file", "path": LOG_SOURCE_PATH},
         "sample_alert_dataset": "data/sample_alerts/synthetic_alerts.json",
     }

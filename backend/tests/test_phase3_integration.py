@@ -28,9 +28,9 @@ def test_new_alert_moves_to_triaged_then_enriched(iso_client):
     alert_id = _ingest(iso_client, destination_ip="185.220.101.5")
     assert iso_client.post(f"/api/v1/alerts/{alert_id}/triage").json()["alert"]["status"] == "TRIAGED"
     assert iso_client.post(f"/api/v1/alerts/{alert_id}/enrich").json()["alert"]["status"] == "ENRICHED"
-    # Existing behaviour is preserved: triage may be re-run on an enriched alert.
+    # Triage may be re-run on an enriched alert, but the status only moves forward: it stays ENRICHED (C15).
     again = iso_client.post(f"/api/v1/alerts/{alert_id}/triage").json()
-    assert again["alert"]["status"] == "TRIAGED"
+    assert again["alert"]["status"] == "ENRICHED"
     assert "enrichment" in again["alert"]["normalized_data"] and "triage" in again["alert"]["normalized_data"]
 
 

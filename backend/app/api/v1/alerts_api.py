@@ -1,16 +1,15 @@
 from typing import List, Optional
-from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Response, status
 from sqlalchemy.orm import Session
 from sqlalchemy import or_
+from sqlalchemy.exc import IntegrityError
 
+from app.core.auth import require
 from app.db.session import get_db
 from app.models.models import AlertModel
 from app.schemas.alert import (
-    AlertIngestRequest, 
-    AlertResponse, 
-    PaginatedAlertResponse, 
-    AlertUpdateStatus,
-    TriageResultResponse,
+    AlertIngestRequest,
+    AlertResponse,
     AlertTriageResponse
 )
 from app.services.normalization import NormalizationService
@@ -19,9 +18,15 @@ import logging
 
 from app.services.audit import log_action
 from app.services.pipeline_steps import triage_alert_record, enrich_alert_record
+from app.services.staleness import detach_closed_alert
 
 router = APIRouter()
 logger = logging.getLogger("socmind.alerts")
+
+
+def _already_stored(db: Session, alert_id: str) -> bool:
+    """True when an alert with this ID is already stored (the ID is the primary key)."""
+    return db.query(AlertModel).filter(AlertModel.id == alert_id).first() is not None
 
 
 def _run_step(db: Session, alert: AlertModel, agent_name: str, step):
@@ -40,18 +45,20 @@ def _run_step(db: Session, alert: AlertModel, agent_name: str, step):
         )
 
 
-@router.post("/alerts", response_model=AlertResponse, status_code=status.HTTP_201_CREATED, summary="Ingest Security Alert")
+@router.post("/alerts", response_model=AlertResponse, status_code=status.HTTP_201_CREATED, summary="Ingest Security Alert", dependencies=[Depends(require("analyst"))])
 def ingest_alert(payload: AlertIngestRequest, db: Session = Depends(get_db)):
     """
     Ingests a raw or semi-structured security alert, normalizes fields deterministically,
     and persists record to the database.
     """
     raw_dict = payload.model_dump(exclude_unset=True)
-    normalized = NormalizationService.normalize_alert(raw_dict)
+    try:
+        normalized = NormalizationService.normalize_alert(raw_dict)
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=f"Invalid event timestamp: {exc}")
 
-    # Check for existing alert with same ID
-    existing = db.query(AlertModel).filter(AlertModel.id == normalized["id"]).first()
-    if existing:
+    # Check for an existing alert with the same ID. The commit below is the authoritative check (see IntegrityError handling).
+    if _already_stored(db, normalized["id"]):
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail=f"Alert with ID {normalized['id']} already exists."
@@ -89,7 +96,12 @@ def ingest_alert(payload: AlertIngestRequest, db: Session = Depends(get_db)):
     db.add(alert_record)
     log_action(db, "API", "ALERT_INGESTED", normalized["id"],
                {"source": normalized["source"], "severity": normalized["severity"]})
-    db.commit()
+    try:
+        db.commit()
+    except IntegrityError:
+        # Another request stored an alert with this ID between the check above and this commit
+        db.rollback()
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=f"Alert with ID {normalized['id']} already exists.")
     db.refresh(alert_record)
 
     return alert_record
@@ -97,6 +109,7 @@ def ingest_alert(payload: AlertIngestRequest, db: Session = Depends(get_db)):
 
 @router.get("/alerts", response_model=List[AlertResponse], summary="List Ingested Security Alerts")
 def list_alerts(
+    response: Response,
     severity: Optional[str] = Query(None, description="Filter by severity (CRITICAL, HIGH, MEDIUM, LOW, INFO)"),
     status: Optional[str] = Query(None, description="Filter by status (NEW, TRIAGED, CORRELATED, CLOSED)"),
     source: Optional[str] = Query(None, description="Filter by security source system"),
@@ -107,6 +120,7 @@ def list_alerts(
 ):
     """
     Returns list of normalized security alerts from the database with filtering & search.
+    The X-Total-Count header holds the number of records matching the filters (not just this page).
     """
     query = db.query(AlertModel)
 
@@ -133,7 +147,9 @@ def list_alerts(
             )
         )
 
-    alerts = query.order_by(AlertModel.timestamp.desc()).offset(offset).limit(limit).all()
+    response.headers["X-Total-Count"] = str(query.count())
+    # The ID breaks ties, so the same query always returns the same order and pages do not repeat or skip alerts
+    alerts = query.order_by(AlertModel.timestamp.desc(), AlertModel.id.desc()).offset(offset).limit(limit).all()
     return alerts
 
 
@@ -151,7 +167,7 @@ def get_alert_by_id(alert_id: str, db: Session = Depends(get_db)):
     return alert
 
 
-@router.post("/alerts/{alert_id}/triage", response_model=AlertTriageResponse, summary="Triage an Existing Alert")
+@router.post("/alerts/{alert_id}/triage", response_model=AlertTriageResponse, summary="Triage an Existing Alert", dependencies=[Depends(require("analyst"))])
 def triage_alert(alert_id: str, db: Session = Depends(get_db)):
     """
     Runs deterministic TriageAgent on an existing alert, persists triage rationale/score,
@@ -176,7 +192,7 @@ def triage_alert(alert_id: str, db: Session = Depends(get_db)):
     }
 
 
-@router.post("/alerts/{alert_id}/enrich", summary="Enrich Alert with IOC Threat Intelligence (Phase 3.2)")
+@router.post("/alerts/{alert_id}/enrich", summary="Enrich Alert with IOC Threat Intelligence (Phase 3.2)", dependencies=[Depends(require("analyst"))])
 def enrich_alert(alert_id: str, db: Session = Depends(get_db)):
     """
     Phase 3.2 — IOC Extraction & Threat Intelligence Enrichment.
@@ -204,7 +220,7 @@ def enrich_alert(alert_id: str, db: Session = Depends(get_db)):
     }
 
 
-@router.delete("/alerts/{alert_id}", summary="Close or Remove Alert")
+@router.delete("/alerts/{alert_id}", summary="Close or Remove Alert", dependencies=[Depends(require("analyst"))])
 def delete_alert(alert_id: str, db: Session = Depends(get_db)):
     """
     Marks an alert status as CLOSED (safe alternative to hard deletion).
@@ -218,16 +234,19 @@ def delete_alert(alert_id: str, db: Session = Depends(get_db)):
 
     alert.status = "CLOSED"
     log_action(db, "API", "ALERT_CLOSED", alert_id)
+    # The alert leaves every active incident that held it, in the same transaction (see staleness.detach_closed_alert)
+    incidents_updated = detach_closed_alert(db, alert_id)
     db.commit()
 
     return {
         "status": "success",
         "message": f"Alert '{alert_id}' has been marked as CLOSED.",
-        "alert_id": alert_id
+        "alert_id": alert_id,
+        "incidents_updated": incidents_updated,
     }
 
 
-@router.post("/alerts/seed", summary="Seed Synthetic Alerts into Database")
+@router.post("/alerts/seed", summary="Seed Synthetic Alerts into Database", dependencies=[Depends(require("analyst"))])
 def seed_alerts(db: Session = Depends(get_db)):
     """
     Populates database with 10 synthetic test alerts. Idempotent check prevents duplicates.

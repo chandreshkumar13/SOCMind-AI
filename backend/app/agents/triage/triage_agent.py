@@ -1,5 +1,6 @@
-import re
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, List
+
+from app.agents.text_match import contains_any, contains_term
 
 
 class TriageAgent:
@@ -53,23 +54,23 @@ class TriageAgent:
         # 2. Command Line Pattern Detection (DATA ONLY - NO EXECUTION)
         cmd = str(alert_data.get("command_line") or alert_data.get("cmd") or "").strip().lower()
         if cmd:
-            if any(p in cmd for p in ["-e ", "-encodedcommand", "aw52b2tl", "base64"]):
+            if contains_any(cmd, ["-e ", "-encodedcommand", "aw52b2tl", "base64"]):
                 indicators.append("Encoded or obfuscated command execution pattern detected")
                 added_points += 20
 
-            if any(p in cmd for p in ["minidump", "comsvcs", "lsass", "rundll32"]):
+            if contains_any(cmd, ["minidump", "comsvcs", "lsass", "rundll32"]):
                 indicators.append("High-risk process memory access pattern detected")
                 added_points += 25
 
-            if any(p in cmd for p in ["downloadstring", "invoke-webrequest", "curl ", "wget ", "bitsadmin"]):
+            if contains_any(cmd, ["downloadstring", "invoke-webrequest", "curl ", "wget ", "bitsadmin"]):
                 indicators.append("Outbound script payload download pattern detected")
                 added_points += 15
 
-            if any(p in cmd for p in ["reg.exe add", "schtasks", "sc create"]):
+            if contains_any(cmd, ["reg.exe add", "schtasks", "sc create"]):
                 indicators.append("Administrative persistence registry/task command pattern detected")
                 added_points += 15
 
-            if any(p in cmd for p in ["executionpolicy bypass", "-noprofile", "-windowstyle hidden"]):
+            if contains_any(cmd, ["executionpolicy bypass", "-noprofile", "-windowstyle hidden"]):
                 indicators.append("PowerShell execution policy bypass or hidden flags detected")
                 added_points += 10
 
@@ -78,23 +79,24 @@ class TriageAgent:
         desc = str(alert_data.get("description") or "").lower()
         combined_text = f"{title} {desc}"
 
+        # Whole-term matches only (see app.agents.text_match): 'c2' does not fire on 'ec2', 'iam' does not fire on 'william'
         high_impact_keywords = ["ransomware", "c2", "command & control", "beaconing", "exfiltration", "privilege escalation"]
         for kw in high_impact_keywords:
-            if kw in combined_text:
+            if contains_term(combined_text, kw):
                 indicators.append(f"High-impact threat category keyword matched: '{kw}'")
                 added_points += 20
                 break
 
         cred_keywords = ["brute force", "failed ssh", "failed login", "kerberoasting", "password spray"]
         for kw in cred_keywords:
-            if kw in combined_text:
+            if contains_term(combined_text, kw):
                 indicators.append(f"Credential attack category keyword matched: '{kw}'")
                 added_points += 15
                 break
 
-        anomaly_keywords = ["unusual", "abnormal", "suspicious", "unrecognized", "tunneling"]
+        anomaly_keywords = ["unusual", "unusually", "abnormal", "abnormally", "suspicious", "unrecognized", "tunneling"]
         for kw in anomaly_keywords:
-            if kw in combined_text:
+            if contains_term(combined_text, kw):
                 indicators.append(f"Suspicious behavior category keyword matched: '{kw}'")
                 added_points += 10
                 break
@@ -130,6 +132,11 @@ class TriageAgent:
             f"Final calculated suspicion score: {suspicion_score}/100. Assigned Triage Priority: {priority}."
         )
 
+        # Every indicator is a 'computed' finding: a deterministic rule applied to the alert's own fields, never threat intelligence
+        findings = [{"type": "computed", "statement": ind,
+                     "basis": "Computed by a deterministic rule applied to the alert's own fields; not threat intelligence."}
+                    for ind in indicators]
+
         return {
             "agent": self.agent_name,
             "model_version": self.model_version,
@@ -139,5 +146,6 @@ class TriageAgent:
             "priority": priority,
             "suspicion_score": suspicion_score,
             "indicators": indicators,
+            "findings": findings,
             "rationale": rationale
         }

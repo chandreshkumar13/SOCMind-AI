@@ -1,5 +1,5 @@
 import ipaddress
-from typing import Dict, Any, Optional
+from typing import Dict, Any
 
 # Pre-defined mock malicious databases
 KNOWN_MALICIOUS_IPS = {
@@ -8,12 +8,15 @@ KNOWN_MALICIOUS_IPS = {
     "203.0.113.88": "Known DNS tunneling exfiltration destination endpoint."
 }
 
+# Synthetic hashes: SHA-256 of labels such as "socmind-mock-sample:file-encryptor". They match no real file, carry no vendor
+# scan results and must not be read as evidence about any real sample. Well-known public hashes (the empty file, 'test') are
+# deliberately absent: they are not malware and would mislead.
 KNOWN_MALICIOUS_HASHES = {
-    "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855": "Trojan.Generic.PowerShellDownloader (48/72 vendors)",
-    "2b8a741369359e19864293fe2f7cfef5f58c70425712ef9e3dfa4b13a8efee5d": "Trojan.Win32.CobaltStrike.DLL (62/72 vendors)",
-    "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08": "Ransomware.Win32.GenericEncryptor (59/72 vendors)",
-    "c138f387a3243171350a4170e3ed510bbf49a0ec947dfeb6e5ebf8695d7eb80a": "HackTool.Win32.Mimikatz.LSASSDump (65/72 vendors)",
-    "4a715f5d6f4618e47d1a293ebc52a0a2df3303d7b32230154673890f55562145": "Trojan.Win32.RegistryAutorunPersistence (42/72 vendors)"
+    "71961ab144a1b3a0a452bf2b13861433ea750a028981f3efd0fc302e0ec0dabc": "MOCK sample: PowerShell downloader (synthetic label)",
+    "1527175195cf32685e8703b31777c1e1a0f88c9c1d658d383ff4cfc6a14417c8": "MOCK sample: DLL loader with C2 beacon (synthetic label)",
+    "2c8dcb4cabfb4d76e27cd49c3b93515b7e5066c3ccf36704b533a13266e79771": "MOCK sample: file encryptor (synthetic label)",
+    "57cbed5ed090e11dd74a27dbc0121a098f237ff82cfca4516f016cc8b9db39f6": "MOCK sample: LSASS credential dumper (synthetic label)",
+    "9e1c81740f1243f6fef46f13eaf7d5e6e2f2eb00f246b19008a9580ca155c5dc": "MOCK sample: registry autorun persistence (synthetic label)",
 }
 
 KNOWN_MALICIOUS_DOMAINS = {
@@ -78,22 +81,22 @@ def query_mock_hash_reputation(file_hash: str) -> Dict[str, Any]:
     """
     h_clean = str(file_hash).strip().lower()
     
+    # The mock has no vendor engine scan, so there is no detection count to report: None, never an invented ratio.
     if h_clean in KNOWN_MALICIOUS_HASHES:
-        threat = KNOWN_MALICIOUS_HASHES.get(h_clean, "Trojan.Generic.Heuristic")
+        threat = KNOWN_MALICIOUS_HASHES[h_clean]
         reputation = "MALICIOUS"
         confidence = 0.98
-        evidence = f"Known malicious file hash identified as {threat}."
-        detection = "48/72"
+        evidence = f"Known malicious file hash in the MOCK dataset: {threat}. Not a real sample and not verified."
     else:
         threat = "None"
         reputation = "UNKNOWN"
         confidence = 0.0
-        evidence = "File hash not found in threat intelligence database."
-        detection = "0/72"
+        evidence = "File hash not found in the MOCK threat intelligence dataset; this does not mean the file is safe."
 
     return {
         "hash": h_clean,
-        "detection_ratio": detection,
+        "detection_ratio": None,
+        "detection_note": "The mock intelligence has no vendor engine counts.",
         "threat_name": threat,
         "reputation": reputation,
         "confidence": confidence,

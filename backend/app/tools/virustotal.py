@@ -47,6 +47,8 @@ STATUS_TEXT = {
     "skipped_invalid": "Not sent to VirusTotal: not a valid public indicator.",
     "skipped_unsupported": "Not sent to VirusTotal: this indicator type is not looked up.",
     "skipped_url": "Not sent to VirusTotal: URL lookups are disabled in this version.",
+    "not_sent_decoded_disabled": "Not sent to VirusTotal: this indicator was decoded from base64 in a command line, and lookups of "
+                                 "decoded indicators are off (VIRUSTOTAL_LOOKUP_DECODED_INDICATORS=false).",
 }
 
 # ---- indicator eligibility ---------------------------------------------------------------------------------------

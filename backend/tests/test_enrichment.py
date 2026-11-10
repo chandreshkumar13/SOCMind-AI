@@ -171,7 +171,7 @@ class TestIOCExtraction:
 
     def test_extracts_sha256_from_file_hash(self):
         """Structured file_hash (SHA256) must be classified correctly."""
-        sha256 = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        sha256 = "71961ab144a1b3a0a452bf2b13861433ea750a028981f3efd0fc302e0ec0dabc"
         alert = {"file_hash": sha256}
         iocs = self.agent.extract_iocs(alert)
         assert any(i["value"] == sha256 and i["type"] == "SHA256" for i in iocs)
@@ -251,7 +251,7 @@ class TestEnrichAlert:
             "id": "TEST-ENR-001",
             "source_ip": "185.220.101.5",
             "destination_ip": "10.0.0.5",
-            "file_hash": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            "file_hash": "71961ab144a1b3a0a452bf2b13861433ea750a028981f3efd0fc302e0ec0dabc",
             "alert_title": "Suspicious Encoded PowerShell Command Execution",
             "severity": "CRITICAL"
         }
@@ -275,7 +275,7 @@ class TestEnrichAlert:
 
     def test_malicious_hash_counted(self):
         """Known malicious SHA256 must increment malicious counter."""
-        sha256 = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        sha256 = "71961ab144a1b3a0a452bf2b13861433ea750a028981f3efd0fc302e0ec0dabc"
         alert = {"file_hash": sha256, "alert_title": "Malware Detected"}
         result = self.agent.enrich_alert(alert)
         assert result["summary"]["malicious"] >= 1
@@ -332,7 +332,7 @@ class TestEnrichIOCsBackwardCompatibility:
         """enriched_iocs_count must match input list length."""
         iocs = [
             {"type": "IP", "value": "192.168.1.1"},
-            {"type": "SHA256", "value": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"}
+            {"type": "SHA256", "value": "71961ab144a1b3a0a452bf2b13861433ea750a028981f3efd0fc302e0ec0dabc"}
         ]
         result = self.agent.enrich_iocs(iocs)
         assert result["enriched_iocs_count"] == 2
@@ -374,7 +374,7 @@ class TestEnrichmentAPIEndpoint:
             "source": "CrowdStrike EDR",
             "severity": "HIGH",
             "source_ip": "185.220.101.5",
-            "file_hash": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            "file_hash": "71961ab144a1b3a0a452bf2b13861433ea750a028981f3efd0fc302e0ec0dabc",
             "command_line": "powershell.exe -ExecutionPolicy Bypass"
         }
         ingest_res = client.post("/api/v1/alerts", json=payload)

@@ -24,9 +24,14 @@ def seed_synthetic_alerts(db: Session) -> Dict[str, Any]:
 
     inserted_count = 0
     skipped_count = 0
+    rejected: List[str] = []           # records that fail validation are reported, never silently stored or guessed
 
     for raw in raw_alerts:
-        normalized = NormalizationService.normalize_alert(raw)
+        try:
+            normalized = NormalizationService.normalize_alert(raw)
+        except ValueError as exc:
+            rejected.append(f"{raw.get('id', '?')}: {exc}")
+            continue
         alert_id = normalized["id"]
         external_id = normalized["external_alert_id"]
 
@@ -73,5 +78,6 @@ def seed_synthetic_alerts(db: Session) -> Dict[str, Any]:
         "status": "success",
         "inserted": inserted_count,
         "skipped": skipped_count,
+        "rejected": rejected,
         "total_processed": len(raw_alerts)
     }

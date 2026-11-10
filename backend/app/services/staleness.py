@@ -16,7 +16,7 @@ and writes audit entries.
 import copy
 import hashlib
 import json
-from datetime import datetime
+from app.core.clock import utc_now
 from typing import Any, Dict, List, Optional, Tuple
 
 from sqlalchemy.orm import Session
@@ -30,7 +30,7 @@ FLAGGED_REPUTATIONS = ("MALICIOUS", "SUSPICIOUS")
 
 
 def now_iso() -> str:
-    return datetime.utcnow().isoformat() + "Z"
+    return utc_now().isoformat() + "Z"
 
 
 def details_copy(incident: IncidentModel) -> Dict[str, Any]:
@@ -151,6 +151,36 @@ def mark_incidents_stale_for_alert(db: Session, alert_id: str, change: str, acto
         _mark_one(db, inc, alert_id, change, actor, withdraw_reason=f"threat intelligence for alert {alert_id} changed ({change})")
         marked.append(inc.id)
     return marked
+
+
+def detach_closed_alert(db: Session, alert_id: str, actor: str = "API") -> List[str]:
+    """Removes a closed alert from every active incident that holds it. The alert record and the incident's history are kept:
+    the alert moves to details.closed_alerts, the analysis is marked stale with the reason, a recorded decision is withdrawn (its
+    history is kept), and an incident left with no active alert is closed. Caller commits. Returns the incident ids changed."""
+    changed: List[str] = []
+    for inc in db.query(IncidentModel).filter(active_incidents_clause()).order_by(IncidentModel.id).all():
+        members = list(inc.correlated_alert_ids or [])
+        if alert_id not in members:
+            continue
+        remaining = [a for a in members if a != alert_id]
+        details = details_copy(inc)
+        when = now_iso()
+        details.setdefault("closed_alerts", []).append({"alert_id": alert_id, "closed_at": when, "closed_by": actor})
+        reasons = list(details.get("stale_reasons") or [])
+        reasons.append({"alert_id": alert_id, "change": "alert was closed and removed from this incident", "at": when})
+        details["stale_reasons"] = reasons[-MAX_STALE_REASONS:]
+        details["investigation_stale"] = True
+        details["recommendations_stale"] = True
+        inc.correlated_alert_ids = remaining
+        inc.details = details
+        if inc.human_approval_status != "PENDING":
+            void_decision(db, inc, actor, f"alert {alert_id} was closed")
+        if not remaining:
+            inc.status = "CLOSED"
+        log_action(db, actor, "INCIDENT_MEMBERSHIP_CHANGED", inc.id,
+                   {"removed_alert": alert_id, "remaining_alerts": len(remaining), "status": inc.status})
+        changed.append(inc.id)
+    return changed
 
 
 def _reconcile_changes(inc: IncidentModel, alerts_by_id: Dict[str, AlertModel]) -> List[Tuple[Optional[str], str]]:

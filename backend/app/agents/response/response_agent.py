@@ -2,6 +2,8 @@ import ipaddress
 import re
 from typing import Any, Dict, List, Optional, Set, Tuple
 
+from app.agents.text_match import contains_any
+
 IMPACT_ORDER = {"NONE": 0, "LOW": 1, "MEDIUM": 2, "HIGH": 3}
 MOCK_INTEL_CAVEAT = "The local threat intelligence is a mock and unverified; confirm the indicator with an authoritative source first."
 LIVE_INTEL_CAVEAT = ("The reputation comes from VirusTotal and is not independently verified; open the VirusTotal report and "
@@ -17,8 +19,7 @@ def _text(a: Dict[str, Any]) -> str:
 
 
 def _has(alert: Dict[str, Any], words: List[str]) -> bool:
-    t = _text(alert)
-    return any(w in t for w in words)
+    return contains_any(_text(alert), words)   # whole-term matches only (see app.agents.text_match)
 
 
 def _flagged_iocs(alerts: List[Dict[str, Any]], ioc_type: str) -> List[str]:
@@ -178,7 +179,7 @@ class ResponseAgent:
                          "required_approvals": approvals, "preconditions": preconditions, "validation_steps": validation})
 
         if strength != "weak":
-            m = match(["ransomware", "encryptor", "bulk file renam"])
+            m = match(["ransomware", "encryptor", "bulk file rename", "bulk file renamed", "bulk file renaming"])
             if m:
                 h = sorted({a["host"] for a in m if a.get("host")}) or hosts
                 add(1, "isolation", f"Isolate host(s) {', '.join(h)} from the network", ", ".join(h),
@@ -191,7 +192,8 @@ class ResponseAgent:
                     preconditions=["Confirm the alerts are not a known backup or encryption job.", "Preserve volatile evidence first if possible.",
                                    "Confirm the host is not a critical production service, or that the business owner accepts the outage."],
                     validation=["Confirm the host no longer reaches the network.", "Confirm file changes stop on shares the host could reach."])
-            m = match(["lsass", "minidump", "comsvcs", "kerberoast", "rc4", "domain admin login", "after-hours", "iam", "policy attachment"])
+            m = match(["lsass", "minidump", "comsvcs", "kerberoast", "kerberoasting", "rc4", "rc4_hmac", "domain admin login",
+                       "after-hours", "iam", "policy attachment"])
             if m:
                 users = sorted({a["username"] for a in m if a.get("username")})
                 add(2, "credentials", f"Reset credentials and revoke active sessions for {', '.join(users) or 'affected accounts'}", ", ".join(users),
@@ -221,7 +223,7 @@ class ResponseAgent:
             unexplained: Dict[str, Tuple[List[Dict[str, Any]], str, str]] = {}   # address -> (alerts, reason, kind)
             for a in alerts:
                 src, dst = _canonical(a.get("source_ip")), _canonical(a.get("destination_ip"))
-                keyword = _has(a, ["c2", "command & control", "command and control", "beacon"])
+                keyword = _has(a, ["c2", "command & control", "command and control", "beacon", "beaconing"])
                 for x in sorted({v for v in (src, dst) if v}):
                     malicious = x in bad_ips and _scope(x) == "external"
                     if not (malicious or (keyword and x == dst)):

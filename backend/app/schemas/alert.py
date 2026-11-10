@@ -37,7 +37,7 @@ class AlertResponse(BaseModel):
     """
     id: str
     external_alert_id: Optional[str] = None
-    timestamp: UTCDateTime
+    timestamp: Optional[UTCDateTime] = None          # None = unknown (never invented); see normalized_data.timestamp_status
     source: str
     alert_title: str
     description: Optional[str] = None

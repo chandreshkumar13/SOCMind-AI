@@ -47,6 +47,9 @@ export function statusLabel(status) {
 /** A decision can be recorded only on a fresh recommendation that nobody has decided yet. */
 export function reviewState(incident) {
   const details = (incident && incident.details) || {};
+  if (incident && incident.status === 'CLOSED') {
+    return { canReview: false, reason: 'This incident is closed because all of its alerts were closed. No decision can be recorded.' };
+  }
   if (!details.recommendations || details.recommendations.length === 0) {
     return { canReview: false, reason: 'No recommendation yet. Generate recommendations first.' };
   }
@@ -125,6 +128,9 @@ export function stageBadgeKey(status) {
 /** Simulation is only possible for a fresh APPROVED decision, and only once. Nothing is ever executed. */
 export function simulationState(incident) {
   const details = (incident && incident.details) || {};
+  if (incident && incident.status === 'CLOSED') {
+    return { canSimulate: false, simulated: Boolean(details.simulation), reason: 'This incident is closed. Nothing is simulated on it.' };
+  }
   if (details.simulation) return { canSimulate: false, simulated: true, reason: 'This approved response was already simulated.' };
   if (!incident || incident.human_approval_status !== 'APPROVED') {
     return { canSimulate: false, simulated: false, reason: 'Only an approved response can be simulated.' };
@@ -307,4 +313,69 @@ export function enrichmentNotices(enrichment) {
   if (enrichment.intel_mode === 'unavailable') notes.push('No lookups were performed, so every reputation is "not checked".');
   if (enrichment.incomplete) notes.push('Some indicators could not be checked yet (request quota, per-alert limit or provider errors). Run the pipeline or enrichment again later to complete them.');
   return notes;
+}
+
+/** Appends the next page to the records already loaded, keeping the first copy of each id (a record can move between pages). */
+export function appendPage(loaded, next, key = 'id') {
+  const seen = new Set(loaded.map((r) => r[key]));
+  return [...loaded, ...(next || []).filter((r) => !seen.has(r[key]))];
+}
+
+/** "Showing 100 of 240 alerts." while the server holds more than is loaded; '' once all are loaded or the total is unknown. */
+export function loadMoreNote(loadedCount, total, noun) {
+  if (total === null || total === undefined || loadedCount >= total) return '';
+  return `Showing ${loadedCount} of ${total} ${noun}.`;
+}
+
+/** The Authorization header for a bearer token, or no header at all when there is no token. */
+export function authHeaders(token) {
+  const value = typeof token === 'string' ? token.trim() : '';
+  return value ? { Authorization: `Bearer ${value}` } : {};
+}
+
+/** A plain-language reason for an access error: a 401 means sign in again, a 403 means the role is missing. '' otherwise. */
+export function describeAccessError(status) {
+  if (status === 401) return 'Sign-in required: this server needs a valid access token. Enter your token in Settings.';
+  if (status === 403) return 'Your access role does not allow this action (it needs a higher role).';
+  return '';
+}
+
+/**
+ * What the incident page says about closed alerts. Null when no alert of the incident has been closed.
+ * A fully closed incident is read-only; a partly closed one has been re-analysed by the backend and is marked out of date.
+ */
+export function closedNotice(incident) {
+  if (!incident) return null;
+  const details = incident.details || {};
+  const closed = Array.isArray(details.closed_alerts) ? details.closed_alerts : [];
+  const alertIds = closed.map((c) => c && c.alert_id).filter(Boolean);
+  if (incident.status === 'CLOSED') {
+    return {
+      level: 'closed',
+      alertIds,
+      text: 'This incident is closed because every alert in it was closed. Nothing is analysed, recommended, decided or simulated on it. Its record is kept for reference.',
+    };
+  }
+  if (alertIds.length > 0) {
+    return {
+      level: 'partial',
+      alertIds,
+      text: `${alertIds.length} alert(s) were closed and removed from this incident. The analysis was marked out of date; re-run the investigation and recommendations before deciding.`,
+    };
+  }
+  return null;
+}
+
+/**
+ * The computed findings of each alert in an incident: deterministic rules applied to the alert's own fields by triage.
+ * They are not threat intelligence and not verified facts, so they are shown apart from both. Alerts without any are left out.
+ */
+export function computedFindingsByAlert(alerts) {
+  return (alerts || [])
+    .map((a) => {
+      const triage = (a && a.normalized_data && a.normalized_data.triage) || {};
+      const statements = (triage.findings || []).filter((f) => f && f.type === 'computed' && f.statement).map((f) => f.statement);
+      return { id: a.id, title: a.alert_title, statements };
+    })
+    .filter((row) => row.statements.length > 0);
 }

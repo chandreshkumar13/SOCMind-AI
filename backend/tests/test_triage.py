@@ -59,7 +59,7 @@ def test_score_never_exceeds_100():
         "severity": "CRITICAL",
         "source_ip": "192.168.1.100",
         "destination_ip": "185.220.101.5",
-        "file_hash": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "file_hash": "71961ab144a1b3a0a452bf2b13861433ea750a028981f3efd0fc302e0ec0dabc",
         "command_line": "powershell.exe -e aW52b2tl minidump reg.exe add downloadstring -ExecutionPolicy Bypass",
         "username": "administrator"
     }

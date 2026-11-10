@@ -2,6 +2,7 @@ from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional
 
 from app.agents.correlation.correlation_agent import parse_timestamp
+from app.agents.text_match import contains_any
 
 LOG_MARGIN = timedelta(minutes=30)
 FLAGGED_REPUTATIONS = ("MALICIOUS", "SUSPICIOUS")
@@ -11,14 +12,14 @@ HYPOTHESIS_RULES = [
     ("T1059.001", "PowerShell", ["powershell"], "PowerShell was used; it may have executed attacker-controlled commands."),
     ("T1027", "Obfuscated Files or Information", ["encodedcommand", "base64"], "A command appears to be encoded, which can be used to hide its purpose."),
     ("T1218.011", "System Binary Proxy Execution: Rundll32", ["rundll32"], "rundll32 was used to run a DLL, a technique that can bypass simple allow-lists."),
-    ("T1071", "Application Layer Protocol", ["c2", "command & control", "command and control", "beacon"], "Network activity is consistent with command-and-control communication."),
+    ("T1071", "Application Layer Protocol", ["c2", "command & control", "command and control", "beacon", "beaconing"], "Network activity is consistent with command-and-control communication."),
     ("T1003.001", "OS Credential Dumping: LSASS Memory", ["minidump", "comsvcs", "lsass.dmp", "memory dump", "credential dump"], "LSASS memory access suggests an attempt to dump credentials."),
     ("T1110", "Brute Force", ["brute force", "failed password", "failed ssh", "failed login", "password spray"], "Repeated failed authentication suggests a brute-force attempt."),
-    ("T1558.003", "Steal or Forge Kerberos Tickets: Kerberoasting", ["kerberoast", "rc4_hmac", "rc4"], "Service-ticket requests with weak encryption suggest Kerberoasting."),
-    ("T1547.001", "Registry Run Keys / Startup Folder", ["currentversion\\run", "reg.exe add"], "A Run-key registry change suggests an attempt to persist across reboots."),
-    ("T1486", "Data Encrypted for Impact", ["ransomware", "encryptor", "bulk file renam"], "Bulk file changes are consistent with ransomware encryption."),
+    ("T1558.003", "Steal or Forge Kerberos Tickets: Kerberoasting", ["kerberoast", "kerberoasting", "rc4_hmac", "rc4"], "Service-ticket requests with weak encryption suggest Kerberoasting."),
+    ("T1547.001", "Registry Run Keys / Startup Folder", ["currentversion\\run", "currentversion\\runonce", "reg.exe add"], "A Run-key registry change suggests an attempt to persist across reboots."),
+    ("T1486", "Data Encrypted for Impact", ["ransomware", "encryptor", "bulk file rename", "bulk file renamed", "bulk file renaming"], "Bulk file changes are consistent with ransomware encryption."),
     ("T1071.004", "Application Layer Protocol: DNS", ["dns tunnel", "tunneling", "dns-query"], "Abnormal DNS payloads suggest data exfiltration or tunneling."),
-    ("T1078", "Valid Accounts", ["after-hours", "domain admin login", "unusual"], "A privileged account was used in an unusual way; credentials may be compromised."),
+    ("T1078", "Valid Accounts", ["after-hours", "domain admin login", "unusual", "unusually"], "A privileged account was used in an unusual way; credentials may be compromised."),
     ("T1098", "Account Manipulation", ["iam", "attach-user-policy", "policy attachment"], "A permission change on an account suggests privilege manipulation."),
 ]
 
@@ -230,10 +231,10 @@ class InvestigationAgent:
             basis = []
             for a in alerts:
                 text = " ".join(str(a.get(k) or "") for k in ("alert_title", "description", "command_line")).lower()
-                if any(w in text for w in words):
+                if contains_any(text, words):
                     basis.append(f"alert:{a['id']}")
             for lg in logs:
-                if any(w in str(lg.get("message", "")).lower() for w in words):
+                if contains_any(str(lg.get("message", "")), words):
                     basis.append(f"log:{lg.get('log_id')}")
             if basis:
                 kinds = {b.split(":")[0] for b in basis}

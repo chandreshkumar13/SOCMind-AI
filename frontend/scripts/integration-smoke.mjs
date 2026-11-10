@@ -251,8 +251,8 @@ try {
   t = html(h(Dash.default, { alerts, incidents, stats, setActiveTab: noop }));
   check('dashboard', t, 'Alerts In Queue', 'Awaiting Human Review', '>10<');
   absent('dashboard has no fabricated metrics', t, 'MTTR', '-78%');
-  t = html(h(Alerts.default, { alerts: alerts.slice(0, 3), loading: false, error: null, refreshAlerts: noop, seedSampleAlerts: noop, totalAlerts: 10 }));
-  check('alerts list notes truncation', t, 'Showing the first 3 of 10.');
+  t = html(h(Alerts.default, { alerts: alerts.slice(0, 3), loading: false, error: null, refreshAlerts: noop, seedSampleAlerts: noop, totalAlerts: 10, alertsTotal: 10, loadMoreAlerts: noop, loadingMore: false }));
+  check('alerts list says how many are loaded and offers load more', t, 'Showing 3 of 10 alerts.', 'Load more');
   const full = await api('/alerts/ALT-2026-001');
   t = html(h(Alerts.AnalysisPanels, { alert: full, busy: false, onRun: noop, runError: null }));
   check('alert analysis shows triage and mock enrichment', t, 'Score', 'MALICIOUS', 'LOCAL MOCK', 'incident');

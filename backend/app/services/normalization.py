@@ -1,7 +1,30 @@
 import re
 import uuid
 from datetime import datetime, timezone
-from typing import Dict, Any, Optional
+from typing import Any, Dict, Optional, Tuple
+
+
+def parse_event_time(raw: Any) -> Tuple[Optional[datetime], str]:
+    """The event time of an alert as naive UTC, with its status.
+
+    ``(value, "given")`` when a time was supplied and parses; ``(None, "missing")`` when no time was supplied. A value that is
+    present but is not an ISO-8601 time raises ValueError: it is never guessed or replaced. An explicit UTC offset is converted
+    to UTC, and a value without an offset is read as UTC (documented in the API)."""
+    if raw is None or (isinstance(raw, str) and not raw.strip()):
+        return None, "missing"
+    if isinstance(raw, datetime):
+        value = raw
+    elif isinstance(raw, str):
+        try:
+            value = datetime.fromisoformat(raw.strip().replace("Z", "+00:00"))
+        except ValueError:
+            raise ValueError(f"'{raw.strip()[:64]}' is not an ISO-8601 timestamp such as 2026-09-03T08:14:00Z") from None
+    else:
+        raise ValueError("the timestamp must be an ISO-8601 string such as 2026-09-03T08:14:00Z")
+    if value.tzinfo is not None:
+        value = value.astimezone(timezone.utc).replace(tzinfo=None)
+    return value, "given"
+
 
 # Severity mapping table
 SEVERITY_MAP = {
@@ -91,20 +114,10 @@ class NormalizationService:
         alert_id = payload.get("id") or f"ALT-{datetime.now().strftime('%Y')}-{uuid.uuid4().hex[:6].upper()}"
         external_id = payload.get("external_alert_id") or payload.get("external_id") or alert_id
 
-        # Extract timestamp
+        # Event time: a missing time stays unknown and a malformed one is rejected (ValueError). Neither is ever replaced by
+        # the ingestion time, so an invented time cannot place the alert on a correlation or investigation timeline.
         raw_ts = payload.get("timestamp") or payload.get("event_time") or payload.get("created_at")
-        if isinstance(raw_ts, datetime):
-            parsed_ts = raw_ts
-        elif isinstance(raw_ts, str):
-            try:
-                parsed_ts = datetime.fromisoformat(raw_ts.strip().replace("Z", "+00:00"))
-            except ValueError:
-                parsed_ts = datetime.utcnow()
-        else:
-            parsed_ts = datetime.utcnow()
-        # Everything is stored as naive UTC. Convert aware values; do not just drop their offset.
-        if parsed_ts.tzinfo is not None:
-            parsed_ts = parsed_ts.astimezone(timezone.utc).replace(tzinfo=None)
+        parsed_ts, timestamp_status = parse_event_time(raw_ts)
 
         # Source normalization
         source = cls.normalize_source(payload.get("source") or payload.get("source_system"))
@@ -199,6 +212,8 @@ class NormalizationService:
                 "raw_severity_input": raw_sev,
                 "raw_source_input": payload.get("source") or payload.get("source_system"),
                 "category": payload.get("category", "Uncategorized"),
-                "process_name": payload.get("process_name")
+                "process_name": payload.get("process_name"),
+                "timestamp_status": timestamp_status,                       # "given" or "missing"
+                "timestamp_input": str(raw_ts).strip()[:64] if raw_ts not in (None, "") else None,
             }
         }

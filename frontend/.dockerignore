@@ -1,0 +1,6 @@
+# Keep local dependencies, build output and secrets out of the image build context
+node_modules
+dist
+.env*
+npm-debug.log*
+.git

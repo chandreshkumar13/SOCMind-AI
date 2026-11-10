@@ -6,6 +6,7 @@ from pydantic import BaseModel, Field
 from sqlalchemy import func
 from sqlalchemy.orm import Session
 
+from app.core.auth import require
 from app.db.session import get_db
 from app.models.models import AuditLogModel
 from app.services.orchestrator import PipelineBusy, PipelineOrchestrator, UnknownAlerts
@@ -26,7 +27,7 @@ class PipelineRunRequest(BaseModel):
     window_hours: int = Field(24, ge=1, le=168)
 
 
-@router.post("/pipeline/run", summary="Run the Multi-Agent Pipeline")
+@router.post("/pipeline/run", summary="Run the Multi-Agent Pipeline", dependencies=[Depends(require("analyst"))])
 def run_pipeline(payload: Optional[PipelineRunRequest] = None, db: Session = Depends(get_db)):
     """
     Triage -> Enrichment -> Correlation -> Investigation -> Response recommendation.
@@ -54,6 +55,13 @@ def list_runs(limit: int = Query(10, ge=1, le=50), db: Session = Depends(get_db)
     return out
 
 
+def _agent_state(total: int, failures: int) -> str:
+    """ATTENTION if any failure is recorded, ACTIVE if the agent has acted, otherwise IDLE. Nothing is claimed beyond the log."""
+    if failures:
+        return "ATTENTION"
+    return "ACTIVE" if total else "IDLE"
+
+
 @router.get("/agents", summary="Agent Status and Activity")
 def agent_status(db: Session = Depends(get_db)) -> List[Dict[str, Any]]:
     """Per-agent activity derived from the audit log (real counts, not static text)."""
@@ -62,7 +70,7 @@ def agent_status(db: Session = Depends(get_db)) -> List[Dict[str, Any]]:
         total = db.query(func.count(AuditLogModel.id)).filter(AuditLogModel.actor == name).scalar() or 0
         last = db.query(AuditLogModel).filter(AuditLogModel.actor == name).order_by(AuditLogModel.id.desc()).first()
         failures = db.query(func.count(AuditLogModel.id)).filter(AuditLogModel.actor == name, AuditLogModel.action == "AGENT_FAILED").scalar() or 0
-        result.append({"name": name, "role": role, "status": "READY", "total_actions": total, "failures": failures,
+        result.append({"name": name, "role": role, "status": _agent_state(total, failures), "total_actions": total, "failures": failures,
                        "last_action": last.action if last else None, "last_target": last.target_id if last else None,
                        "last_run_at": last.timestamp.isoformat() if last else None})
     return result

@@ -8,6 +8,7 @@ from typing import Any, Dict
 
 from sqlalchemy.orm import Session
 
+from app.agents.enrichment.encoded_commands import decode_command_line_payloads
 from app.agents.enrichment.enrichment_agent import EnrichmentAgent
 from app.agents.enrichment.live_enrichment_agent import LiveEnrichmentAgent
 from app.agents.triage.triage_agent import TriageAgent
@@ -19,7 +20,8 @@ from app.services.threat_intel import get_client, resolve_provider
 
 # Statuses a triage / enrichment step may move forward from. Any other status (CLOSED, CORRELATED,
 # ...) is left untouched: a closed alert is never re-opened and an alert is never moved backwards.
-TRIAGE_FROM = ("NEW", "TRIAGED", "ENRICHED")
+# Triage must not list ENRICHED here: re-running triage on an enriched alert would otherwise set it back to TRIAGED.
+TRIAGE_FROM = ("NEW", "TRIAGED")
 ENRICH_FROM = ("NEW", "TRIAGED", "ENRICHED")
 
 INTEL_DISCLAIMER = (
@@ -90,7 +92,8 @@ def enrich_alert_record(db: Session, alert: AlertModel) -> Dict[str, Any]:
     previous = (alert.normalized_data or {}).get("enrichment")
     choice = resolve_provider()
     if choice.active == "virustotal":
-        agent = LiveEnrichmentAgent(get_client(), settings.VIRUSTOTAL_MAX_LOOKUPS_PER_ALERT)
+        agent = LiveEnrichmentAgent(get_client(), settings.VIRUSTOTAL_MAX_LOOKUPS_PER_ALERT,
+                                    lookup_decoded=settings.VIRUSTOTAL_LOOKUP_DECODED_INDICATORS)
         result = agent.enrich_alert(alert_dict(alert))
         result["intel_mode"] = "live"
         result["provider"] = "VirusTotal"
@@ -109,6 +112,9 @@ def enrich_alert_record(db: Session, alert: AlertModel) -> Dict[str, Any]:
         result["intel_mode"] = "unavailable"
         result["disclaimer"] = UNAVAILABLE_DISCLAIMER
     result["verified"] = False
+    payloads = decode_command_line_payloads(alert.command_line)     # analysis only: decoded text is never executed
+    if payloads:
+        result["encoded_payloads"] = payloads
     data = dict(alert.normalized_data or {})
     data["enrichment"] = result
     alert.normalized_data = data
