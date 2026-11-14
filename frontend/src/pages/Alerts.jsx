@@ -1,8 +1,10 @@
 import React, { useEffect, useRef, useState } from 'react';
 import { Filter, Search, PlusCircle, RefreshCw, AlertTriangle } from 'lucide-react';
 import StatusBadge from '../components/StatusBadge';
+import { ActionButton, ErrorCard } from '../components/StateCards';
 import { api } from '../api';
 import { alertSearchPath, detectionLabel, enrichmentNotices, fetchAlertSearch, formatUtc, intelSource, isRetryableLookup, loadMoreNote, lookupStatusLabel, refreshedSelection, reputationKey, reputationSource, safeVirusTotalUrl, searchCapNote } from '../lib/view';
+import { CLOSE_CONFIRMATION, SEVERITY_FILTERS, STATUS_FILTERS, alertMatchesSearch, filterAlerts, isAlertClosed, statusFilterLabel } from '../lib/alertFilters';
 
 // Where the reputations came from, as stored on the record. Live results are blue and name their provider;
 // everything else keeps the amber "unverified" tint.
@@ -121,16 +123,40 @@ export function AnalysisPanels({ alert, busy, onRun, runError }) {
   );
 }
 
-// Search over the fields an analyst is likely to type: title, source, host, user, alert ID and IP addresses.
-// Case-insensitive, ignores surrounding spaces, and an empty query matches every alert.
-export function alertMatchesSearch(alert, searchQuery) {
-  const query = searchQuery.trim().toLowerCase();
-  const fields = [
-    alert.alert_title || alert.alert_name, alert.source || alert.source_system, alert.host || alert.host_name,
-    alert.username || alert.user, alert.id, alert.source_ip, alert.destination_ip,
-  ];
-  return fields.some((field) => String(field || '').toLowerCase().includes(query));
+// Status management for one alert: the Close alert button, its confirmation and any error. Closing marks the alert CLOSED (it is
+// never deleted), removes it from active incidents, and cannot be undone. Nothing is executed. The request is sent only after the
+// user confirms.
+export function CloseAlertControl({ alert, confirming, busy, error, onAsk, onCancel, onConfirm }) {
+  const closed = isAlertClosed(alert);
+  const small = { fontSize: '11px', color: 'var(--text-muted)' };
+  return (
+    <div style={{ marginTop: '12px', paddingTop: '12px', borderTop: '1px solid var(--border-color)' }}>
+      <strong style={{ color: 'var(--accent-cyan)' }}>Status management</strong>
+      {closed && <div style={{ ...small, marginTop: '4px' }}>This alert is CLOSED. A closed alert cannot be reopened.</div>}
+      {!confirming && (
+        <div style={{ marginTop: '8px' }}>
+          <ActionButton variant="danger" disabled={closed || busy} title={closed ? 'This alert is already closed' : 'Mark this alert as CLOSED'} onClick={onAsk}>
+            Close alert
+          </ActionButton>
+        </div>
+      )}
+      {confirming && !closed && (
+        <div role="alertdialog" aria-label="Confirm closing the alert" style={{ marginTop: '8px', padding: '10px 12px', borderRadius: 'var(--radius-sm)', border: '1px solid rgba(239, 68, 68, 0.5)' }}>
+          <div style={{ fontSize: '12px', color: 'var(--text-main)', marginBottom: '8px' }}>{CLOSE_CONFIRMATION}</div>
+          <div style={{ display: 'flex', gap: '8px' }}>
+            <ActionButton variant="danger" busy={busy} onClick={onConfirm}>Confirm close</ActionButton>
+            <ActionButton variant="ghost" disabled={busy} onClick={onCancel}>Cancel</ActionButton>
+          </div>
+        </div>
+      )}
+      {error && <div style={{ marginTop: '10px' }}><ErrorCard title="Could not close the alert" message={error} /></div>}
+    </div>
+  );
 }
+
+// The search and filter rules live in lib/alertFilters.js (pure, unit-tested). alertMatchesSearch is still exported from this page,
+// because the integration test imports it from here.
+export { alertMatchesSearch };
 
 // Pause after the last keystroke before asking the server, so typing does not send a request per character.
 const SEARCH_DEBOUNCE_MS = 250;
@@ -139,6 +165,7 @@ export default function Alerts({ alerts, loading, error, refreshAlerts, seedSamp
   const [analysisBusy, setAnalysisBusy] = useState(false);
   const [analysisError, setAnalysisError] = useState(null);
   const [filterSeverity, setFilterSeverity] = useState('ALL');
+  const [filterStatus, setFilterStatus] = useState('ALL');
   const [searchQuery, setSearchQuery] = useState('');
   const [selectedAlert, setSelectedAlert] = useState(null);
   const [fetchingDetail, setFetchingDetail] = useState(false);
@@ -147,6 +174,9 @@ export default function Alerts({ alerts, loading, error, refreshAlerts, seedSamp
   const [searching, setSearching] = useState(false);
   const [searchError, setSearchError] = useState(null);
   const [ingestError, setIngestError] = useState(null);     // shown inline instead of a blocking alert()
+  const [closeConfirming, setCloseConfirming] = useState(false);   // the "close this alert?" question is showing
+  const [closing, setClosing] = useState(false);
+  const [closeError, setCloseError] = useState(null);
   const searchSequence = useRef(0);   // a response from an older search run is ignored
 
   // The drawer holds its own copy of the alert. Keep it in step with the list the page loads, so a result stored
@@ -154,6 +184,12 @@ export default function Alerts({ alerts, loading, error, refreshAlerts, seedSamp
   useEffect(() => {
     setSelectedAlert(prev => (prev ? refreshedSelection(prev, alerts) : prev));
   }, [alerts]);
+
+  // A different alert starts without a pending close question or an old error.
+  useEffect(() => {
+    setCloseConfirming(false);
+    setCloseError(null);
+  }, [selectedAlert?.id]);
 
   // Server-side search over every alert, not only the loaded first page. It waits briefly after typing, and it runs
   // again whenever the list reloads (ingest, triage, enrichment, refresh), so matches never show an older state.
@@ -179,16 +215,12 @@ export default function Alerts({ alerts, loading, error, refreshAlerts, seedSamp
 
   useEffect(() => () => { searchSequence.current += 1; }, []);
 
-  // Client-side severity filter. While a search is active, the server's matches replace the loaded list. Until they
+  // Client-side severity and status filters (see lib/alertFilters.js). While a search is active, the server's matches replace the loaded list. Until they
   // arrive, or if the search fails, the loaded list is filtered locally so the table never goes blank.
   const searchActive = alertSearchPath(searchQuery) !== null;
   const serverMatches = searchActive && searchResult && searchResult.term === searchQuery.trim() ? searchResult.rows : null;
   const capNote = serverMatches ? searchCapNote(serverMatches.length) : '';
-  const filteredAlerts = (serverMatches || alerts).filter(a => {
-    const sev = (a.severity || a.raw_severity || '').toUpperCase();
-    const matchesSev = filterSeverity === 'ALL' || sev === filterSeverity;
-    return matchesSev && (serverMatches !== null || alertMatchesSearch(a, searchQuery));
-  });
+  const filteredAlerts = filterAlerts(alerts, { severity: filterSeverity, status: filterStatus, search: searchQuery }, serverMatches);
 
   // Handle clicking row to inspect single alert details via GET /api/v1/alerts/{id}
   const handleInspectAlert = async (alertId) => {
@@ -245,6 +277,24 @@ export default function Alerts({ alerts, loading, error, refreshAlerts, seedSamp
     }
   };
 
+  // Close the selected alert via DELETE /api/v1/alerts/{id}. It is reached only from the confirmation, never from the first click.
+  // On success the alert shows as CLOSED at once, and alerts, incidents and statistics are reloaded.
+  const handleConfirmClose = async () => {
+    const id = selectedAlert.id;
+    setClosing(true);
+    setCloseError(null);
+    try {
+      await api(`/alerts/${id}`, { method: 'DELETE' });
+      setCloseConfirming(false);
+      setSelectedAlert((prev) => (prev && prev.id === id ? { ...prev, status: 'CLOSED' } : prev));
+      await refreshAlerts();
+    } catch (err) {
+      setCloseError(err.message);
+    } finally {
+      setClosing(false);
+    }
+  };
+
   return (
     <div>
       {/* Top Filter and Actions Bar */}
@@ -272,7 +322,7 @@ export default function Alerts({ alerts, loading, error, refreshAlerts, seedSamp
 
           <div style={{ display: 'flex', gap: '6px', alignItems: 'center', flexWrap: 'wrap' }}>
             <Filter size={16} color="var(--text-muted)" />
-            {['ALL', 'CRITICAL', 'HIGH', 'MEDIUM', 'LOW', 'INFO'].map(sev => (
+            {SEVERITY_FILTERS.map(sev => (
               <button
                 key={sev}
                 onClick={() => setFilterSeverity(sev)}
@@ -291,6 +341,11 @@ export default function Alerts({ alerts, loading, error, refreshAlerts, seedSamp
               </button>
             ))}
           </div>
+
+          <select aria-label="Filter by alert status" value={filterStatus} onChange={(e) => setFilterStatus(e.target.value)}
+            style={{ padding: '6px 10px', borderRadius: 'var(--radius-sm)', border: '1px solid var(--border-color)', background: 'var(--bg-dark)', color: 'var(--text-main)', fontSize: '12px' }}>
+            {STATUS_FILTERS.map((s) => <option key={s} value={s}>{statusFilterLabel(s)}</option>)}
+          </select>
         </div>
 
         <div style={{ display: 'flex', gap: '10px' }}>
@@ -370,7 +425,7 @@ export default function Alerts({ alerts, loading, error, refreshAlerts, seedSamp
 
       {!loading && !searchActive && loadMoreNote(alerts.length, alertsTotal, 'alerts') && (
         <div style={{ display: 'flex', gap: '10px', alignItems: 'center', flexWrap: 'wrap', fontSize: '12px', color: '#fde047', marginBottom: '10px' }}>
-          <span>{loadMoreNote(alerts.length, alertsTotal, 'alerts')} The severity filter applies to the loaded alerts; search covers every alert.</span>
+          <span>{loadMoreNote(alerts.length, alertsTotal, 'alerts')} The severity and status filters apply to the loaded alerts; search covers every alert.</span>
           {loadMoreAlerts && (
             <button onClick={loadMoreAlerts} disabled={loadingMore} style={{ padding: '4px 10px', borderRadius: 'var(--radius-sm)', border: '1px solid var(--border-color)', background: 'rgba(255,255,255,0.05)', color: 'var(--accent-cyan)', fontSize: '12px', cursor: loadingMore ? 'wait' : 'pointer' }}>
               {loadingMore ? 'Loading...' : 'Load more'}
@@ -417,7 +472,7 @@ export default function Alerts({ alerts, loading, error, refreshAlerts, seedSamp
                             </button>
                           )}
                         </>
-                      ) : 'No security alerts found matching the active search/severity filter.'}
+                      ) : 'No security alerts found matching the active search/severity/status filter.'}
                     </td>
                   </tr>
                 ) : (
@@ -559,6 +614,10 @@ export default function Alerts({ alerts, loading, error, refreshAlerts, seedSamp
                   </div>
 
                   <AnalysisPanels alert={selectedAlert} busy={analysisBusy} onRun={handleRunAnalysis} runError={analysisError} />
+                  <CloseAlertControl alert={selectedAlert} confirming={closeConfirming} busy={closing} error={closeError}
+                    onAsk={() => { setCloseError(null); setCloseConfirming(true); }}
+                    onCancel={() => { setCloseConfirming(false); setCloseError(null); }}
+                    onConfirm={handleConfirmClose} />
                 </div>
               )}
             </div>
