@@ -390,6 +390,20 @@ try {
   absent('dashboard has no fabricated metrics', t, 'MTTR', '-78%');
   t = html(h(Alerts.default, { alerts: alerts.slice(0, 3), loading: false, error: null, refreshAlerts: noop, seedSampleAlerts: noop, totalAlerts: 10, alertsTotal: 10, loadMoreAlerts: noop, loadingMore: false }));
   check('alerts list says how many are loaded and offers load more', t, 'Showing 3 of 10 alerts.', 'Load more');
+  check('alerts page offers a status filter with every backend status', t, 'Filter by alert status', 'Any status', 'New', 'Triaged', 'Enriched', 'Correlated', 'Investigating', 'Closed');
+  check('alerts page says both filters apply to the loaded alerts', t, 'The severity and status filters apply to the loaded alerts');
+  const closeProps = { alert: { id: 'ALT-X', status: 'TRIAGED' }, confirming: false, busy: false, error: null, onAsk: noop, onCancel: noop, onConfirm: noop };
+  t = html(h(Alerts.CloseAlertControl, closeProps));
+  check('close control: an open alert shows a Close alert button', t, 'Close alert');
+  absent('close control: no confirmation before the first click', t, 'Confirm close', 'It cannot be reopened');
+  t = html(h(Alerts.CloseAlertControl, { ...closeProps, confirming: true }));
+  check('close control: the confirmation says what closing does and that nothing is executed', t,
+    'This marks the alert CLOSED and removes it from active incidents. It cannot be reopened. Nothing is executed.', 'Confirm close', 'Cancel');
+  t = html(h(Alerts.CloseAlertControl, { ...closeProps, alert: { id: 'ALT-X', status: 'CLOSED' } }));
+  check('close control: a closed alert says it cannot be reopened', t, 'This alert is CLOSED', 'cannot be reopened');
+  expect('close control: the Close alert button is disabled for a closed alert', /disabled=""[^>]*>Close alert</.test(t), t.slice(0, 300));
+  t = html(h(Alerts.CloseAlertControl, { ...closeProps, error: 'This action needs the analyst role.' }));
+  check('close control: a failure is shown in an error card', t, 'Could not close the alert', 'This action needs the analyst role.');
   const full = await api('/alerts/ALT-2026-001');
   t = html(h(Alerts.AnalysisPanels, { alert: full, busy: false, onRun: noop, runError: null }));
   check('alert analysis shows triage and mock enrichment', t, 'Score', 'MALICIOUS', 'LOCAL MOCK', 'incident');
@@ -480,6 +494,34 @@ try {
   absent('settings has no fake controls', t, '<select', 'VERIFIED', 'Gemini', 'OpenAI');
   check('sidebar', html(h(Side.default, { activeTab: 'audit', setActiveTab: noop, counts: { alerts: 10, incidents: 2, audit: stats.audit_entries } })), 'Audit Log', '>10<');
   check('topbar', html(h(Top.default, { activeTab: 'audit', online: true })), 'Audit Trail', 'Backend API: Online');
+
+  // ---- closing an alert (the same DELETE call the page sends after its confirmation), checked against the real backend
+  const filterLib = await server.ssrLoadModule('/src/lib/alertFilters.js');
+  const beforeClose = await api('/alerts?limit=100');
+  const toClose = beforeClose.find((a) => a.status !== 'CLOSED');
+  expect('there is an open alert to close', Boolean(toClose));
+  if (toClose) {
+    const closeResult = await api(`/alerts/${toClose.id}`, { method: 'DELETE' });
+    expect('closing reports success and names the alert', closeResult.status === 'success' && closeResult.alert_id === toClose.id, JSON.stringify(closeResult));
+    expect('closing reports which incidents were updated', Array.isArray(closeResult.incidents_updated));
+    const afterClose = await api(`/alerts/${toClose.id}`);
+    expect('the closed alert now reads back as CLOSED', afterClose.status === 'CLOSED', afterClose.status);
+    const serverClosed = await api('/alerts?status=CLOSED&limit=100');
+    expect('the server status filter lists the closed alert', serverClosed.some((a) => a.id === toClose.id) && serverClosed.every((a) => a.status === 'CLOSED'));
+    const reloaded = await api('/alerts?limit=100');
+    expect('a closed alert stays in the full list (it is not deleted)', reloaded.length === beforeClose.length && reloaded.some((a) => a.id === toClose.id));
+    const clientClosed = filterLib.filterAlerts(reloaded, { status: 'CLOSED' }).map((a) => a.id).sort();
+    expect('the page filter agrees with the server filter on live data', JSON.stringify(clientClosed) === JSON.stringify(serverClosed.map((a) => a.id).sort()), JSON.stringify(clientClosed));
+    const clientOpen = filterLib.filterAlerts(reloaded, { status: 'NEW' });
+    expect('the closed alert is not listed under another status', !clientOpen.some((a) => a.id === toClose.id));
+    const statsAfter = await api('/stats');
+    expect('statistics count the closed alert', (statsAfter.alerts.by_status.CLOSED || 0) >= 1, JSON.stringify(statsAfter.alerts.by_status));
+    const auditRows = await api(`/audit-logs?action=ALERT_CLOSED&target_id=${toClose.id}`);
+    expect('the close is in the audit log', auditRows.length >= 1, JSON.stringify(auditRows));
+    let reclose = null;
+    try { await api('/alerts/NOPE-NOT-AN-ALERT', { method: 'DELETE' }); } catch (e) { reclose = e; }
+    expect('closing an unknown alert is a readable 404', reclose instanceof ApiError && reclose.status === 404, String(reclose));
+  }
 
   await accountsModeCheck();
   await tokenModeCheck();

@@ -228,6 +228,8 @@ The backend tests always run on a **throw-away database in the system temp direc
 opened (`tests/test_db_isolation.py` proves it). The integration test needs Python with `backend/requirements.txt`
 installed (`PYTHON=python3 npm run test:integration` selects another interpreter).
 
+`backend/tests/test_e2e_workflow.py` is the end-to-end workflow test: through the API only, one alert is ingested, triaged, enriched (mock intelligence), correlated into an incident, investigated, given recommendations, approved, simulated (nothing is executed) and closed, with an assertion at every step and an audit-log entry checked for each major action.
+
 **Latest verification (2026-11-10, Windows, Python 3.14, Node 24):**
 
 | Command | Result |
