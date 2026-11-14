@@ -1,8 +1,33 @@
-import { authHeaders, describeError } from './lib/view.js';
+import { describeError } from './lib/view.js';
+import { requestHeaders, signedOutAfter } from './lib/session.js';
 
-// The access token (used when the backend runs in token mode) lives in this browser tab only: sessionStorage, not
-// localStorage, so it is gone when the tab closes. Storage can be blocked, so every access is guarded.
+// Two ways to prove who is calling, depending on the backend's AUTH_MODE (the app sets the mode from /auth/status before it
+// requests any protected data):
+//  - accounts: an HttpOnly session cookie that JavaScript cannot read. It is sent automatically (credentials: 'include').
+//    Writes also carry the session's CSRF token, which is kept in memory only. A bearer token is never sent in this mode.
+//  - token: a static bearer token that Settings → Access keeps in sessionStorage for this browser tab only.
+//  - disabled (demo) and unknown: no authentication header.
 const TOKEN_KEY = 'socmind.token';
+
+// Dispatched on window when a request is refused with 401 in accounts mode, meaning the session has ended. The app listens for it
+// and shows the sign-in page again.
+export const SIGNED_OUT_EVENT = 'socmind:signed-out';
+
+let authMode = 'unknown';
+export function setAuthMode(mode) {
+  authMode = typeof mode === 'string' && mode ? mode : 'unknown';
+}
+export function getAuthMode() {
+  return authMode;
+}
+
+let csrfToken = '';
+export function setCsrfToken(token) {
+  csrfToken = typeof token === 'string' ? token : '';
+}
+export function getCsrfToken() {
+  return csrfToken;
+}
 
 export function readStoredToken() {
   try {
@@ -50,12 +75,19 @@ export async function apiPage(path, options = {}) {
 
 async function request(path, { method = 'GET', body } = {}) {
   let res;
-  const headers = { ...authHeaders(readStoredToken()), ...(body === undefined ? {} : { 'Content-Type': 'application/json' }) };
+  const headers = requestHeaders({
+    mode: authMode,
+    storedToken: readStoredToken(),
+    csrf: csrfToken,
+    method,
+    hasBody: body !== undefined,
+  });
   try {
     res = await fetch(`${API_BASE}${path}`, {
       method,
       headers: Object.keys(headers).length ? headers : undefined,
       body: body === undefined ? undefined : JSON.stringify(body),
+      credentials: 'include',           // sends the session cookie to the API (same site, see docs/SECURITY.md)
     });
   } catch {
     throw new ApiError(`Cannot reach the backend at ${API_BASE}. Is the FastAPI server running?`, 0);
@@ -66,7 +98,16 @@ async function request(path, { method = 'GET', body } = {}) {
   } catch {
     /* empty or non-JSON body */
   }
-  if (!res.ok) throw new ApiError(describeError(res.status, data), res.status);
+  if (!res.ok) {
+    if (signedOutAfter({ mode: authMode, status: res.status, path })) {
+      try {
+        window.dispatchEvent(new Event(SIGNED_OUT_EVENT));
+      } catch {
+        /* no window (tests): nothing to notify */
+      }
+    }
+    throw new ApiError(describeError(res.status, data), res.status);
+  }
   const header = res.headers && res.headers.get ? res.headers.get('X-Total-Count') : null;
   const parsed = header === null ? NaN : Number(header);
   return { data, total: Number.isFinite(parsed) ? parsed : null };

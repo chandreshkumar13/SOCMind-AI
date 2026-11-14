@@ -55,6 +55,15 @@ class Settings(BaseSettings):
     # validate_auth_config instead, whose messages never include a value.
     AUTH_TOKENS: List[Any] = []
 
+    # Accounts mode (AUTH_MODE=accounts): people sign in with a username and password and get a session cookie.
+    # See docs/SECURITY.md for the rules these numbers implement.
+    SESSION_IDLE_MINUTES: int = 30           # a session ends after this long without use
+    SESSION_ABSOLUTE_HOURS: int = 8          # and in any case this long after sign-in
+    LOGIN_MAX_FAILURES: int = 5              # failed sign-ins for one username + client address ...
+    LOGIN_LOCK_MINUTES: int = 15             # ... lock that pair for this long
+    # None = the session cookie is Secure outside development and test (required in production). False is refused in production.
+    SESSION_COOKIE_SECURE: Optional[bool] = None
+
     # Logging
     LOG_LEVEL: str = "INFO"
 

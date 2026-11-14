@@ -81,10 +81,11 @@ def runtime_config() -> Dict[str, Any]:
                 "note": "All five agents are deterministic rule-based code; no LLM is called."},
         "authentication": {
             "mode": settings.AUTH_MODE,
-            "enabled": settings.AUTH_MODE == "token",
-            "note": ("Token mode: every request needs a bearer token; roles are viewer, analyst and approver, and the reviewer is the token's name."
-                     if settings.AUTH_MODE == "token" else
-                     "Demo mode: no authentication. Reviewer names are self-asserted. Do not expose it to untrusted networks."),
+            "enabled": settings.AUTH_MODE in ("token", "accounts"),
+            "note": {
+                "token": "Token mode: every request needs a bearer token; roles are viewer, analyst and approver, and the reviewer is the token's name.",
+                "accounts": "Accounts mode: people sign in with a username and password (HttpOnly session cookie, CSRF header on writes). Roles are viewer, analyst and approver; the reviewer is the signed-in account.",
+            }.get(settings.AUTH_MODE, "Demo mode: no authentication. Reviewer names are self-asserted. Do not expose it to untrusted networks."),
         },
         "investigation_log_source": {"type": "synthetic_sample_file", "path": LOG_SOURCE_PATH},
         "sample_alert_dataset": "data/sample_alerts/synthetic_alerts.json",
