@@ -36,6 +36,7 @@ def init_db():
     Initializes database tables if they do not already exist.
     """
     from app.models.models import AlertModel, IncidentModel, AuditLogModel  # noqa
+    from app.models import auth_models  # noqa: F401  (accounts mode: users, sessions, login attempts)
     Base.metadata.create_all(bind=engine)
     ensure_columns(engine)
 

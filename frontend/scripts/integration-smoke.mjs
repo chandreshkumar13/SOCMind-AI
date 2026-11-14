@@ -9,6 +9,7 @@
 //
 // It cannot run a browser: it renders React to HTML on the server, so clicks and layout are not covered.
 import { spawn } from 'node:child_process';
+import crypto from 'node:crypto';
 import fs from 'node:fs';
 import net from 'node:net';
 import os from 'node:os';
@@ -36,6 +37,142 @@ const freePort = () => new Promise((resolve, reject) => {
   s.listen(0, '127.0.0.1', () => { const { port } = s.address(); s.close(() => resolve(port)); });
   s.on('error', reject);
 });
+
+
+// ---- accounts mode, over real HTTP against a real backend on its own throw-away database.
+// The account is created by the backend's own account service, with a random password that exists only for this run and is
+// passed in the environment of that one child process (getpass cannot read piped input on Windows, so the CLI is not used here;
+// tests/test_accounts_cli.py covers the CLI). Node's fetch keeps no cookie jar, so the cookie is carried by hand. That checks the
+// contract the browser relies on; it does not prove the browser's own cookie handling.
+async function accountsModeCheck() {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'socmind-acc-'));
+  const accPort = await freePort();
+  const accBase = `http://127.0.0.1:${accPort}/api/v1`;
+  const password = crypto.randomBytes(18).toString('base64url');
+  const staticToken = crypto.randomBytes(18).toString('base64url');
+  const env = {
+    ...process.env,
+    THREAT_INTEL_PROVIDER: 'mock', THREAT_INTEL_MOCK_MODE: 'True', VIRUSTOTAL_API_KEY: '',
+    AUTH_MODE: 'accounts', AUTH_TOKENS: JSON.stringify([{ name: 'Automation', role: 'viewer', token: staticToken }]), ENVIRONMENT: 'development',
+    DATABASE_URL: `sqlite:///${path.join(dir, 'accounts.db').replace(/\\/g, '/')}`,
+    PYTHONDONTWRITEBYTECODE: '1',
+  };
+  let acc = null;
+  let accLog = '';
+  try {
+    // The program is built from lines and joined with a newline character, so no escape sequences are needed.
+    const pythonLines = [
+      'import os',
+      'from app.db.session import init_db, SessionLocal',
+      'from app.services import accounts',
+      'init_db()',
+      'db = SessionLocal()',
+      'accounts.create_user(db, "ana.analyst", "analyst", os.environ["SOCMIND_IT_PASSWORD"])',
+      'print("created")',
+    ];
+    const made = await new Promise((resolve) => {
+      const p = spawn(python, ['-c', pythonLines.join(String.fromCharCode(10))], { cwd: backend, env: { ...env, SOCMIND_IT_PASSWORD: password } });
+      let out = '';
+      p.stdout.on('data', (d) => { out += d; });
+      p.stderr.on('data', (d) => { out += d; });
+      p.on('close', (code) => resolve({ code, out }));
+    });
+    expect('an account is created for the run', made.code === 0 && made.out.includes('created'), made.out.slice(-300));
+
+    acc = spawn(python, ['-m', 'uvicorn', 'app.main:app', '--host', '127.0.0.1', '--port', String(accPort), '--log-level', 'warning'], { cwd: backend, env });
+    acc.stdout.on('data', (d) => { accLog += d; });
+    acc.stderr.on('data', (d) => { accLog += d; });
+    let up = false;
+    for (let i = 0; i < 80 && !up; i += 1) {
+      try { up = (await fetch(`${accBase}/health`)).ok; } catch { await new Promise((r) => setTimeout(r, 250)); }
+    }
+    if (!up) throw new Error(`accounts backend did not start: ${accLog.slice(-600)}`);
+
+    const status = await (await fetch(`${accBase}/auth/status`)).json();
+    expect('status says sign-in is required', status.mode === 'accounts' && status.sign_in === true, JSON.stringify(status));
+    expect('protected data is refused before sign-in', (await fetch(`${accBase}/alerts`)).status === 401);
+
+    const wrong = await fetch(`${accBase}/auth/login`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ username: 'ana.analyst', password: 'not-the-password-0' }) });
+    expect('a wrong password is refused with the generic message', wrong.status === 401 && (await wrong.json()).detail === 'Invalid username or password.');
+
+    const login = await fetch(`${accBase}/auth/login`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ username: 'ana.analyst', password }) });
+    expect('the right password signs in', login.status === 200, String(login.status));
+    const setCookie = login.headers.get('set-cookie') || '';
+    expect('the session cookie is HttpOnly and SameSite=Strict', /HttpOnly/i.test(setCookie) && /SameSite=Strict/i.test(setCookie), setCookie);
+    const cookie = setCookie.split(';')[0];
+    const session = await login.json();
+    expect('the session token is not in the response body', cookie.length > 20 && !JSON.stringify(session).includes(cookie.split('=')[1]));
+    expect('the password is not in the response body', !JSON.stringify(session).includes(password));
+    const csrf = session.csrf_token;
+    expect('a CSRF token is issued with the session', typeof csrf === 'string' && csrf.length >= 40);
+
+    const me = await (await fetch(`${accBase}/auth/me`, { headers: { Cookie: cookie } })).json();
+    expect('the session identifies the account and its role', me.name === 'ana.analyst' && me.role === 'analyst' && me.csrf_token === csrf, JSON.stringify(me));
+    expect('reads work with the cookie alone', (await fetch(`${accBase}/alerts`, { headers: { Cookie: cookie } })).status === 200);
+    const refreshed = await (await fetch(`${accBase}/auth/me`, { headers: { Cookie: cookie } })).json();
+    expect('a page refresh (a second read with the same cookie) keeps the same account', refreshed.name === 'ana.analyst');
+    const both = { Cookie: cookie, Authorization: `Bearer ${staticToken}` };
+    const precedence = await (await fetch(`${accBase}/auth/me`, { headers: both })).json();
+    expect('with a cookie and a bearer token together, the cookie account is the identity', precedence.mode === 'accounts' && precedence.name === 'ana.analyst', JSON.stringify(precedence));
+    expect('a write with the cookie and a bearer token but no CSRF token is refused, not taken as the bearer', (await fetch(`${accBase}/alerts/seed`, { method: 'POST', headers: both })).status === 403);
+    expect('a bearer token still works alone when no cookie is sent', (await fetch(`${accBase}/alerts`, { headers: { Authorization: `Bearer ${staticToken}` } })).status === 200);
+    expect('a write without the CSRF header is refused', (await fetch(`${accBase}/alerts/seed`, { method: 'POST', headers: { Cookie: cookie } })).status === 403);
+    expect('a write with the CSRF header works for an analyst', (await fetch(`${accBase}/alerts/seed`, { method: 'POST', headers: { Cookie: cookie, 'X-CSRF-Token': csrf } })).status === 200);
+
+    const out = await fetch(`${accBase}/auth/logout`, { method: 'POST', headers: { Cookie: cookie, 'X-CSRF-Token': csrf } });
+    expect('logout succeeds with the CSRF header', out.status === 200 && (await out.json()).authenticated === false);
+    expect('the cookie is cleared by logout', /Max-Age=0/i.test(out.headers.get('set-cookie') || ''));
+    expect('the old cookie is refused after logout (server-side revocation)', (await fetch(`${accBase}/auth/me`, { headers: { Cookie: cookie } })).status === 401);
+  } catch (err) {
+    failures.push(`accounts-mode check crashed: ${err.stack || err}`);
+  } finally {
+    if (acc && !acc.killed) acc.kill();
+    await new Promise((r) => setTimeout(r, 300));
+    fs.rmSync(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 });
+  }
+}
+
+// ---- token mode, over real HTTP on its own backend and database. Sign-in is not offered; the static bearer token is the only
+// credential, and a cookie alone counts for nothing.
+async function tokenModeCheck() {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'socmind-tok-'));
+  const tokPort = await freePort();
+  const tokBase = `http://127.0.0.1:${tokPort}/api/v1`;
+  const bearer = crypto.randomBytes(18).toString('base64url');
+  const env = {
+    ...process.env,
+    THREAT_INTEL_PROVIDER: 'mock', THREAT_INTEL_MOCK_MODE: 'True', VIRUSTOTAL_API_KEY: '',
+    AUTH_MODE: 'token', AUTH_TOKENS: JSON.stringify([{ name: 'Automation', role: 'analyst', token: bearer }]), ENVIRONMENT: 'development',
+    DATABASE_URL: `sqlite:///${path.join(dir, 'token.db').replace(/\\/g, '/')}`,
+    PYTHONDONTWRITEBYTECODE: '1',
+  };
+  let proc = null;
+  let log = '';
+  try {
+    proc = spawn(python, ['-m', 'uvicorn', 'app.main:app', '--host', '127.0.0.1', '--port', String(tokPort), '--log-level', 'warning'], { cwd: backend, env });
+    proc.stdout.on('data', (d) => { log += d; });
+    proc.stderr.on('data', (d) => { log += d; });
+    let up = false;
+    for (let i = 0; i < 80 && !up; i += 1) {
+      try { up = (await fetch(`${tokBase}/health`)).ok; } catch { await new Promise((r) => setTimeout(r, 250)); }
+    }
+    if (!up) throw new Error(`token backend did not start: ${log.slice(-600)}`);
+    const status = await (await fetch(`${tokBase}/auth/status`)).json();
+    expect('token mode: status requires a token and does not offer sign-in', status.mode === 'token' && status.login_required === true && status.sign_in === false, JSON.stringify(status));
+    expect('token mode: sign-in is not offered (404)', (await fetch(`${tokBase}/auth/login`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' })).status === 404);
+    expect('token mode: protected data needs the bearer token (401 without it)', (await fetch(`${tokBase}/alerts`)).status === 401);
+    expect('token mode: a bearer token gets in', (await fetch(`${tokBase}/alerts`, { headers: { Authorization: `Bearer ${bearer}` } })).status === 200);
+    expect('token mode: the token identity and role are reported', (await (await fetch(`${tokBase}/auth/me`, { headers: { Authorization: `Bearer ${bearer}` } })).json()).role === 'analyst');
+    expect('token mode: a wrong token is refused (401)', (await fetch(`${tokBase}/alerts`, { headers: { Authorization: 'Bearer not-the-token-0123456789' } })).status === 401);
+    expect('token mode: a write with the token needs no CSRF header', (await fetch(`${tokBase}/alerts/seed`, { method: 'POST', headers: { Authorization: `Bearer ${bearer}` } })).status === 200);
+  } catch (err) {
+    failures.push(`token-mode check crashed: ${err.stack || err}`);
+  } finally {
+    if (proc && !proc.killed) proc.kill();
+    await new Promise((r) => setTimeout(r, 300));
+    fs.rmSync(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 });
+  }
+}
 
 const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'socmind-it-'));
 const port = await freePort();
@@ -343,6 +480,72 @@ try {
   absent('settings has no fake controls', t, '<select', 'VERIFIED', 'Gemini', 'OpenAI');
   check('sidebar', html(h(Side.default, { activeTab: 'audit', setActiveTab: noop, counts: { alerts: 10, incidents: 2, audit: stats.audit_entries } })), 'Audit Log', '>10<');
   check('topbar', html(h(Top.default, { activeTab: 'audit', online: true })), 'Audit Trail', 'Backend API: Online');
+
+  await accountsModeCheck();
+  await tokenModeCheck();
+  // ---- api.js and Settings by authentication mode (header check, real module)
+  await (async () => {
+    const sent = [];
+    const realFetch = globalThis.fetch;
+    const hadWindow = Object.prototype.hasOwnProperty.call(globalThis, 'window');
+    const previousWindow = globalThis.window;
+    const store = new Map([['socmind.token', 'stale-browser-token-0123456789']]);
+    globalThis.window = {
+      sessionStorage: {
+        getItem: (key) => (store.has(key) ? store.get(key) : null),
+        setItem: (key, value) => store.set(key, value),
+        removeItem: (key) => store.delete(key),
+      },
+      dispatchEvent: () => true,
+    };
+    globalThis.fetch = async (url, init = {}) => {
+      sent.push({ url: String(url), headers: { ...(init.headers || {}) } });
+      return realFetch(url, init);
+    };
+    let mod = null;
+    try {
+      mod = await server.ssrLoadModule('/src/api.js');
+      const last = () => sent[sent.length - 1].headers;
+
+      mod.setAuthMode('accounts');
+      await mod.api('/config');
+      expect('accounts mode sends no Authorization header, even with a stored bearer token', last().Authorization === undefined, JSON.stringify(last()));
+      await mod.api('/incidents/NO-SUCH/recommend', { method: 'POST' }).catch(() => {});
+      expect('accounts mode writes send no Authorization header either', last().Authorization === undefined, JSON.stringify(last()));
+
+      mod.setAuthMode('token');
+      await mod.api('/config');
+      expect('token mode still sends its stored bearer token', last().Authorization === 'Bearer stale-browser-token-0123456789', JSON.stringify(last()));
+
+      mod.setAuthMode('disabled');
+      await mod.api('/config');
+      expect('demo mode sends no Authorization header', last().Authorization === undefined);
+
+      mod.setAuthMode('unknown');
+      await mod.api('/config');
+      expect('before the mode is known, nothing is sent', last().Authorization === undefined);
+    } catch (err) {
+      failures.push(`header-mode check crashed: ${err.stack || err}`);
+    } finally {
+      if (mod) mod.setAuthMode('unknown');
+      globalThis.fetch = realFetch;
+      if (hadWindow) globalThis.window = previousWindow;
+      else delete globalThis.window;
+    }
+
+    // Settings, rendered per mode
+    const SettingsPage = (await server.ssrLoadModule('/src/pages/Settings.jsx')).default;
+    const accountOut = html(h(SettingsPage, { authMode: 'accounts', account: { authenticated: true, name: 'ana.analyst', role: 'analyst', idle_timeout_minutes: 30 } }));
+    absent('Settings in accounts mode has no bearer-token input', accountOut, 'aria-label="Access token"', 'If the server runs in token mode');
+    check('Settings in accounts mode shows the signed-in account', accountOut, 'Signed-in account', 'ana.analyst', 'Analyst');
+    const tokenOut = html(h(SettingsPage, { authMode: 'token' }));
+    check('Settings in token mode keeps the bearer-token input', tokenOut, 'aria-label="Access token"', 'If the server runs in token mode');
+    const demoOut = html(h(SettingsPage, { authMode: 'disabled' }));
+    check('Settings in demo mode keeps the demo wording', demoOut, 'In demo mode no token is needed');
+    absent('Settings in demo mode has no account card', demoOut, 'Signed-in account');
+    const pendingOut = html(h(SettingsPage, { authMode: 'unknown' }));
+    absent('Settings claims nothing about access before the mode is known', pendingOut, 'aria-label="Access token"', 'Signed-in account');
+  })();
 } catch (err) {
   failures.push(`integration run crashed: ${err.stack || err}`);
 } finally {

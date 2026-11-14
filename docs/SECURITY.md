@@ -12,6 +12,7 @@ Two modes, chosen with `AUTH_MODE`:
 | --- | --- | --- |
 | `disabled` (default) | Anyone who can reach the server. Every action is allowed. | Self-asserted free text from the request. |
 | `token` | Only callers that send `Authorization: Bearer <token>` for an entry in `AUTH_TOKENS`. | The name on the token. The request's reviewer field is ignored. |
+| `accounts` | People who sign in with a username and password (see *Accounts mode* below), and callers with a static token from `AUTH_TOKENS`. | The signed-in account's name, or the token's name. The request's reviewer field is ignored. |
 
 Roles are ordered: **viewer < analyst < approver**.
 
@@ -47,6 +48,67 @@ Where tokens live:
 - The browser keeps the token it is given in `sessionStorage` (Settings → Access). It is kept for that tab only, is not
   written to `localStorage`, and is removed by "Clear token" or when the tab closes. Anyone with access to that browser tab
   while it is open can use the token.
+
+## Accounts mode (sign-in with a password)
+
+`AUTH_MODE=accounts` lets people sign in. No account exists by default and none is created by the software; the first one is
+made from the command line.
+
+- **Creating accounts:** `python -m app.cli.accounts create-user --username NAME --role viewer|analyst|approver`. The password is
+  read with `getpass`, twice. It is never a command-line argument, a file or an environment variable. Other commands:
+  `list-users`, `disable-user`, `enable-user`. The CLI creates the account tables in the database named by `DATABASE_URL` if
+  they are missing.
+- **Passwords:** scrypt from the standard library with N=2^17, r=8, p=1, a random 16-byte salt for each password, a 32-byte
+  hash, compared in constant time. A password must be 12 to 1024 characters. Measured on the development machine: about
+  0.5 s and about 128 MiB per hash. At most two hashes run at once in each process, which keeps memory bounded.
+- **Signing in:** `POST /api/v1/auth/login` with JSON `{"username": ..., "password": ...}`. An unknown name, a wrong password and a
+  disabled account all get the same answer, `401 Invalid username or password.`, after the same amount of work.
+- **Lockout:** five failed sign-ins for one username and one client address lock that pair for 15 minutes (`429`). The lock
+  also refuses the correct password. It applies to every name, existing or not, so it reveals nothing about accounts. Failures
+  more than 15 minutes apart do not add up. The counters are in the database, so the lock holds across worker processes. A
+  successful sign-in clears the pair's count.
+- **Session:** an opaque random token (`secrets.token_urlsafe(32)`) in a cookie named `socmind_session` that is `HttpOnly`,
+  `SameSite=Strict` and `Path=/`. It is `Secure` by default outside development and test, and `SESSION_COOKIE_SECURE=false` is
+  refused outside them. Only the SHA-256 of the token is stored. A session ends after `SESSION_IDLE_MINUTES` (30) without use,
+  and at most `SESSION_ABSOLUTE_HOURS` (8) after sign-in. It also ends on logout, and when its account is disabled, which takes
+  effect on the next request.
+- **CSRF:** the sign-in response and `GET /api/v1/auth/me` carry the session's CSRF token. Each `POST`, `PUT`, `PATCH` or
+  `DELETE` that uses the cookie must send it in the `X-CSRF-Token` header, or the answer is `403`. Reads need no token. The
+  frontend keeps the token in memory only.
+- **Logout:** `POST /api/v1/auth/logout`, with the CSRF token. The session is revoked on the server, so a copy of the cookie
+  stops working at once, and the browser's cookie is cleared.
+- **Roles and reviewers:** unchanged. The account's role is used for every check, and the reviewer on a decision is the
+  account's name.
+- **Static tokens:** `AUTH_TOKENS` still work in this mode for automation. Logout does not affect them.
+- **Precedence:** in this mode a valid session cookie decides the identity, even when the request also carries a bearer token.
+  A write made with the cookie that lacks the CSRF token is refused (`403`); it is never taken as the bearer token instead. A
+  bearer token is used only when no valid session cookie exists.
+- **CSRF token, not stored:** the CSRF token is `sha256("csrf:" + session token)`, computed by the server from the cookie on each
+  request. Only the session's SHA-256 is in the database, so the database holds no CSRF value.
+- **Browser behaviour:** the page never attaches a bearer token in this mode, and removes one left from another mode when it
+  learns the mode. Settings shows the signed-in account and its session limits instead of the token card.
+- **Audit log:** `LOGIN`, `LOGIN_FAILED`, `LOGIN_LOCKED` and `LOGOUT` entries record the account name (or `(invalid username)`)
+  and the client address. They never hold a password or a token. Viewers can read the audit log, so they can see sign-in
+  attempts and addresses.
+- **Frontend:** the sign-in page is shown until the server confirms a session, and nothing is loaded before that. A `401` from any
+  request returns the user to the sign-in page and removes the data from the screen.
+
+Required for a deployment in this mode: HTTPS in front of the backend (the cookie is `Secure`); the frontend and the API on the
+same site, because `SameSite=Strict` cookies are not sent across sites; and one worker process, as for every other in-process
+limit in this application.
+
+Known limits of accounts mode:
+
+- There is no password reset, no multi-factor authentication and no self-service registration.
+- Lockout is per username and client address. It does not stop a distributed attack from many addresses, and there is no global
+  limit per account. A reverse proxy that hides client addresses makes every client share one address for lockout.
+- The client address is the connection's address. `X-Forwarded-For` is not trusted.
+- Anything that runs in the page can use the session, as with any cookie session. The CSRF token is readable by same-origin
+  scripts through `GET /api/v1/auth/me`.
+- The concurrency cap on hashing is per process, so total memory is the cap multiplied by the number of worker processes.
+- Passwords are not checked against lists of breached passwords.
+- The timing guard for unknown names (the same work is done) is verified by tests that check the work is performed. It is not
+  measured under load.
 
 ## What is not protected
 

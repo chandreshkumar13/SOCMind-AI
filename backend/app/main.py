@@ -5,13 +5,13 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 import uvicorn
 
-from app.core.auth import validate_auth_config
+from app.core.auth import session_cookie_secure, validate_auth_config
 from app.core.config import settings
 from app.core.runtime import process_model_note, worker_processes
 from app.api.v1.router import api_router
 
 # A misconfigured token setup stops the application at startup instead of leaving it open or unusable
-validate_auth_config(settings.AUTH_MODE, settings.AUTH_TOKENS, settings.ENVIRONMENT)
+validate_auth_config(settings.AUTH_MODE, settings.AUTH_TOKENS, settings.ENVIRONMENT, cookie_secure=session_cookie_secure())
 from app.db.session import init_db
 from app.services.threat_intel import resolve_provider
 
@@ -25,6 +25,16 @@ async def lifespan(app: FastAPI):
     note = process_model_note(worker_processes(), live_provider=choice.active == "virustotal")
     if note:
         logger.warning(note)
+    if settings.AUTH_MODE == "accounts":
+        from app.db.session import SessionLocal
+        from app.services import accounts as account_service
+        db = SessionLocal()
+        try:
+            if account_service.user_count(db) == 0:
+                logger.warning("AUTH_MODE=accounts and no active account exists yet. Create the first one with: "
+                               "python -m app.cli.accounts create-user --username NAME --role approver")
+        finally:
+            db.close()
     yield
 
 # Also ensure DB tables exist upon module import

@@ -3,7 +3,8 @@ import { Sliders, Shield, Database, RefreshCw } from 'lucide-react';
 import { ActionButton, ErrorCard, LoadingCard } from '../components/StateCards';
 import { api, API_BASE, readStoredToken, storeToken } from '../api';
 import useAsync from '../lib/useAsync';
-import { describeAccessError } from '../lib/view';
+import { describeAccessError, formatUtc } from '../lib/view';
+import { roleLabel, settingsAccessView } from '../lib/session';
 
 const row = { display: 'flex', justifyContent: 'space-between', gap: '16px', padding: '8px 0', borderBottom: '1px solid var(--border-color)', fontSize: '13px' };
 const label = { color: 'var(--text-muted)' };
@@ -78,7 +79,29 @@ function AccessCard() {
 }
 
 /** Read-only view of what the backend is actually configured to do (GET /config). Nothing here is editable. */
-export default function Settings() {
+// The signed-in account, shown in accounts mode in place of the bearer-token card. The session itself is a cookie this page cannot
+// read; sign-out is the button in the top bar, which ends the session on the server.
+function AccountCard({ account }) {
+  if (!account || !account.authenticated) {
+    return (
+      <div className="glass-card" style={{ marginBottom: '20px' }}>
+        <h3 style={{ fontSize: '15px', marginBottom: '8px' }}>Access</h3>
+        <p style={{ fontSize: '12px', color: 'var(--text-muted)' }}>No account is signed in. Sign in to continue.</p>
+      </div>
+    );
+  }
+  return (
+    <div className="glass-card" style={{ marginBottom: '20px' }}>
+      <h3 style={{ fontSize: '15px', marginBottom: '8px' }}>Signed-in account</h3>
+      <Row name="Account" value={account.name} />
+      <Row name="Role" value={roleLabel(account.role)} note="Viewers read. Analysts work alerts and the pipeline. Approvers decide responses." />
+      <Row name="Session" value={account.idle_timeout_minutes ? `Ends after ${account.idle_timeout_minutes} minutes without use` : 'Ends after inactivity'}
+        note={account.expires_at ? `At the latest at ${formatUtc(account.expires_at)}.` : undefined} />
+    </div>
+  );
+}
+
+export default function Settings({ authMode = 'unknown', account = null }) {
   const { loading, error, data: cfg, reload } = useAsync(() => api('/config'), []);
 
   return (
@@ -90,7 +113,8 @@ export default function Settings() {
         <ActionButton variant="ghost" onClick={reload}><RefreshCw size={12} style={{ verticalAlign: '-2px' }} /> Refresh</ActionButton>
       </div>
 
-      <AccessCard />
+      {settingsAccessView(authMode) === 'account' && <AccountCard account={account} />}
+      {(settingsAccessView(authMode) === 'token' || settingsAccessView(authMode) === 'demo') && <AccessCard />}
 
       {loading && !cfg && <LoadingCard>Loading configuration...</LoadingCard>}
       {error && <ErrorCard title="Could not load the configuration" message={error} onRetry={reload} />}

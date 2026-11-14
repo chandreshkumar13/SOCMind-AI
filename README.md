@@ -137,6 +137,19 @@ AUTH_MODE=token
 AUTH_TOKENS=[{"name": "Ana Analyst", "role": "analyst", "token": "<at least 16 random characters>"}]
 ```
 
+**Accounts (sign-in with a password).** `AUTH_MODE=accounts` shows a sign-in page. Create the first account from the command line;
+the password is typed at a prompt, never passed as an argument:
+
+```
+cd backend
+python -m app.cli.accounts create-user --username ana.analyst --role analyst
+python -m app.cli.accounts list-users
+```
+
+Sessions last 30 minutes without use and 8 hours at most. Five failed sign-ins for one name and address lock that pair for 15
+minutes. The session cookie is `HttpOnly` and `SameSite=Strict`, and it is `Secure` outside development. Deploy behind HTTPS with
+the frontend and the API on the same site. The full rules and their limits are in [docs/SECURITY.md](docs/SECURITY.md).
+
 Settings has an *Access* card where a token can be entered for the browser tab (kept in `sessionStorage`, cleared when
 the tab closes).
 

@@ -1,7 +1,13 @@
 import React from 'react';
-import { Activity, Bell, User, Cpu } from 'lucide-react';
+import { Activity, LogOut, User } from 'lucide-react';
+import { identityLabel } from '../lib/session';
 
-export default function Topbar({ activeTab, online }) {
+/**
+ * The top bar. `user` is the signed-in account as returned by the server (or null); `mode` is the server's AUTH_MODE.
+ * Nobody is shown as signed in unless the server says so.
+ */
+export default function Topbar({ activeTab, online, user = null, mode = null, onSignOut = null }) {
+  const identity = identityLabel(user, mode);
   const status = online === null ? 'Checking...' : online ? 'Online' : 'Unreachable';
   const color = online === false ? '#f87171' : 'var(--accent-cyan)';
   const titles = {
@@ -70,9 +76,19 @@ export default function Topbar({ activeTab, online }) {
             <User size={16} />
           </div>
           <div style={{ fontSize: '13px' }}>
-            <div style={{ fontWeight: 600 }}>Chandresh Kumar</div>
-            <div style={{ fontSize: '11px', color: 'var(--text-muted)' }}>Lead SOC Analyst</div>
+            <div style={{ fontWeight: 600 }}>{identity.title}</div>
+            {identity.subtitle && <div style={{ fontSize: '11px', color: 'var(--text-muted)' }}>{identity.subtitle}</div>}
           </div>
+          {onSignOut && user && (
+            <button type="button" onClick={onSignOut} title="End this session"
+              style={{
+                display: 'inline-flex', alignItems: 'center', gap: '6px', padding: '6px 10px', marginLeft: '6px',
+                borderRadius: 'var(--radius-sm)', border: '1px solid var(--border-color)', background: 'transparent',
+                color: 'var(--text-muted)', fontSize: '12px', fontWeight: 600, cursor: 'pointer',
+              }}>
+              <LogOut size={12} /> Sign out
+            </button>
+          )}
         </div>
       </div>
     </header>
