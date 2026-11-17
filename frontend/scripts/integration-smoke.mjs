@@ -54,6 +54,8 @@ async function accountsModeCheck() {
     ...process.env,
     THREAT_INTEL_PROVIDER: 'mock', THREAT_INTEL_MOCK_MODE: 'True', VIRUSTOTAL_API_KEY: '',
     AUTH_MODE: 'accounts', AUTH_TOKENS: JSON.stringify([{ name: 'Automation', role: 'viewer', token: staticToken }]), ENVIRONMENT: 'development',
+    // the application's defaults, whatever backend/.env or the shell says
+    SESSION_IDLE_MINUTES: '30', SESSION_ABSOLUTE_HOURS: '8', LOGIN_MAX_FAILURES: '5', LOGIN_LOCK_MINUTES: '15', ALLOW_GUEST: 'false',
     DATABASE_URL: `sqlite:///${path.join(dir, 'accounts.db').replace(/\\/g, '/')}`,
     PYTHONDONTWRITEBYTECODE: '1',
   };
@@ -68,6 +70,7 @@ async function accountsModeCheck() {
       'init_db()',
       'db = SessionLocal()',
       'accounts.create_user(db, "ana.analyst", "analyst", os.environ["SOCMIND_IT_PASSWORD"])',
+      'accounts.create_user(db, "boss.approver", "approver", os.environ["SOCMIND_IT_PASSWORD"])',
       'print("created")',
     ];
     const made = await new Promise((resolve) => {
@@ -90,6 +93,10 @@ async function accountsModeCheck() {
 
     const status = await (await fetch(`${accBase}/auth/status`)).json();
     expect('status says sign-in is required', status.mode === 'accounts' && status.sign_in === true, JSON.stringify(status));
+    expect('status says no setup is needed once accounts exist, and no guest button by default', status.setup_required === false && status.guest_allowed === false, JSON.stringify(status));
+    const lateSetup = await fetch(`${accBase}/auth/setup`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ username: 'late.admin', password: 'a-long-enough-passphrase-1', confirm: 'a-long-enough-passphrase-1' }) });
+    expect('first-run setup is closed once an account exists (409)', lateSetup.status === 409 && !(await lateSetup.text()).includes('a-long-enough-passphrase-1'));
+    expect('the guest route does not exist by default (404)', (await fetch(`${accBase}/auth/guest`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' })).status === 404);
     expect('protected data is refused before sign-in', (await fetch(`${accBase}/alerts`)).status === 401);
 
     const wrong = await fetch(`${accBase}/auth/login`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ username: 'ana.analyst', password: 'not-the-password-0' }) });
@@ -123,10 +130,197 @@ async function accountsModeCheck() {
     expect('logout succeeds with the CSRF header', out.status === 200 && (await out.json()).authenticated === false);
     expect('the cookie is cleared by logout', /Max-Age=0/i.test(out.headers.get('set-cookie') || ''));
     expect('the old cookie is refused after logout (server-side revocation)', (await fetch(`${accBase}/auth/me`, { headers: { Cookie: cookie } })).status === 401);
+
+    // ---- account management and password change, over real HTTP. The new passwords exist only for this run.
+    const newAccountPassword = crypto.randomBytes(18).toString('base64url');
+    const changedPassword = crypto.randomBytes(18).toString('base64url');
+    const jsonHeaders = (cookieValue, csrfValue) => ({ 'Content-Type': 'application/json', Cookie: cookieValue, ...(csrfValue ? { 'X-CSRF-Token': csrfValue } : {}) });
+    const signInAs = async (name, pw) => {
+      const r = await fetch(`${accBase}/auth/login`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ username: name, password: pw }) });
+      const body = await r.json().catch(() => ({}));
+      return { status: r.status, cookie: (r.headers.get('set-cookie') || '').split(';')[0], csrf: body.csrf_token, body };
+    };
+    const post = (urlPath, who, body) => fetch(`${accBase}${urlPath}`, { method: 'POST', headers: jsonHeaders(who.cookie, who.csrf), body: body === undefined ? undefined : JSON.stringify(body) });
+
+    const boss = await signInAs('boss.approver', password);
+    expect('an approver account signs in, and the answer says how long the session lasts', boss.status === 200 && boss.body.role === 'approver' && boss.body.expires_in_seconds > 28000 && boss.body.idle_timeout_minutes === 30, JSON.stringify(boss.body));
+    const bossMe = await (await fetch(`${accBase}/auth/me`, { headers: { Cookie: boss.cookie } })).json();
+    expect('the session check reports the seconds left too, for the expiry warning', bossMe.expires_in_seconds > 28000 && bossMe.expires_in_seconds <= boss.body.expires_in_seconds, JSON.stringify(bossMe));
+
+    const usersRes = await fetch(`${accBase}/auth/users`, { headers: { Cookie: boss.cookie } });
+    const usersText = await usersRes.text();
+    const usersList = usersRes.status === 200 ? JSON.parse(usersText) : [];
+    expect('an approver lists the accounts', usersRes.status === 200 && usersList.map((u) => u.username).sort().join() === 'ana.analyst,boss.approver', usersText.slice(0, 300));
+    expect('an account record holds only username, role, state and creation time', usersList.length > 0 && usersList.every((u) => Object.keys(u).sort().join() === 'created_at,is_active,role,username'));
+    expect('the account list holds no password and no hash', !usersText.includes(password) && !usersText.includes('scrypt$'));
+
+    const ana = await signInAs('ana.analyst', password);
+    expect('an analyst cannot list accounts (403)', (await fetch(`${accBase}/auth/users`, { headers: { Cookie: ana.cookie } })).status === 403);
+    expect('an analyst cannot create an account (403)', (await post('/auth/users', ana, { username: 'sneaky.one', role: 'approver', password: newAccountPassword })).status === 403);
+    expect('there is no public sign-up: creating an account without signing in is refused (401)', (await fetch(`${accBase}/auth/users`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ username: 'sneaky.two', role: 'viewer', password: newAccountPassword }) })).status === 401);
+    expect('creating an account without the CSRF header is refused (403)', (await fetch(`${accBase}/auth/users`, { method: 'POST', headers: jsonHeaders(boss.cookie, ''), body: JSON.stringify({ username: 'sneaky.three', role: 'viewer', password: newAccountPassword }) })).status === 403);
+
+    const created = await post('/auth/users', boss, { username: 'new.analyst', role: 'analyst', password: newAccountPassword });
+    const createdText = await created.text();
+    expect('an approver creates an account (201) and the answer holds no password', created.status === 201 && JSON.parse(createdText).username === 'new.analyst' && !createdText.includes(newAccountPassword) && !createdText.includes('scrypt$'), createdText.slice(0, 200));
+    expect('the new account appears in the list', (await (await fetch(`${accBase}/auth/users`, { headers: { Cookie: boss.cookie } })).json()).some((u) => u.username === 'new.analyst' && u.is_active === true && u.role === 'analyst'));
+    expect('a duplicate username is a 409', (await post('/auth/users', boss, { username: 'New.Analyst', role: 'viewer', password: newAccountPassword })).status === 409);
+    const weak = await post('/auth/users', boss, { username: 'weak.one', role: 'viewer', password: 'tiny-pw-1' });
+    expect('a weak password is a 422 that does not repeat it', weak.status === 422 && !(await weak.text()).includes('tiny-pw-1'));
+    const missing = await post('/auth/users', boss, { role: 'viewer', password: newAccountPassword });
+    expect('a request with a missing field is a 422 that does not send the password back', missing.status === 422 && !(await missing.text()).includes(newAccountPassword));
+    const newcomer = await signInAs('new.analyst', newAccountPassword);
+    expect('the new account signs in with its own password', newcomer.status === 200 && newcomer.body.role === 'analyst', JSON.stringify(newcomer.body));
+
+    expect('an approver cannot disable their own account (409)', (await post('/auth/users/boss.approver/disable', boss)).status === 409);
+    const disabledRes = await post('/auth/users/new.analyst/disable', boss);
+    expect('an approver disables an account', disabledRes.status === 200 && (await disabledRes.json()).is_active === false);
+    expect('the open session of a disabled account ends', (await fetch(`${accBase}/alerts`, { headers: { Cookie: newcomer.cookie } })).status === 401);
+    expect('a disabled account cannot sign in', (await signInAs('new.analyst', newAccountPassword)).status === 401);
+    expect('an approver enables the account again', (await post('/auth/users/new.analyst/enable', boss)).status === 200 && (await signInAs('new.analyst', newAccountPassword)).status === 200);
+
+    const bossOther = await signInAs('boss.approver', password);       // a second session of the same account
+    expect('a wrong current password is refused (401) and changes nothing', (await post('/auth/password', boss, { current_password: 'not-the-password-1', new_password: changedPassword })).status === 401 && (await fetch(`${accBase}/auth/me`, { headers: { Cookie: bossOther.cookie } })).status === 200);
+    expect('a weak new password is refused (422)', (await post('/auth/password', boss, { current_password: password, new_password: 'tiny-pw-2' })).status === 422);
+    const changedRes = await post('/auth/password', boss, { current_password: password, new_password: changedPassword });
+    const changedText = await changedRes.text();
+    expect('the approver changes their own password and one other session is ended', changedRes.status === 200 && JSON.parse(changedText).other_sessions_ended === 1 && !changedText.includes(password) && !changedText.includes(changedPassword), changedText.slice(0, 200));
+    expect('the session that changed the password stays open', (await fetch(`${accBase}/auth/me`, { headers: { Cookie: boss.cookie } })).status === 200);
+    expect('the other session of that account is refused (401)', (await fetch(`${accBase}/auth/me`, { headers: { Cookie: bossOther.cookie } })).status === 401);
+    expect('the old password no longer signs in', (await signInAs('boss.approver', password)).status === 401);
+    expect('the new password signs in', (await signInAs('boss.approver', changedPassword)).status === 200);
+
+    // ---- an approver resets another account's password
+    const resetPassword = crypto.randomBytes(18).toString('base64url');
+    const victim = await signInAs('new.analyst', newAccountPassword);        // an open session that the reset must end
+    expect('an open session exists before the reset', (await fetch(`${accBase}/alerts`, { headers: { Cookie: victim.cookie } })).status === 200);
+    expect('an analyst cannot reset a password (403)', (await post('/auth/users/boss.approver/password', ana, { new_password: resetPassword })).status === 403);
+    expect('a reset without signing in is refused (401)', (await fetch(`${accBase}/auth/users/new.analyst/password`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ new_password: resetPassword }) })).status === 401);
+    expect('a reset without the CSRF header is refused (403)', (await fetch(`${accBase}/auth/users/new.analyst/password`, { method: 'POST', headers: jsonHeaders(boss.cookie, ''), body: JSON.stringify({ new_password: resetPassword }) })).status === 403);
+    expect('an approver cannot reset their own password that way (409)', (await post('/auth/users/boss.approver/password', boss, { new_password: resetPassword })).status === 409);
+    expect('resetting an unknown account is a 404', (await post('/auth/users/no.such.user/password', boss, { new_password: resetPassword })).status === 404);
+    const weakReset = await post('/auth/users/new.analyst/password', boss, { new_password: 'tiny-pw-3' });
+    expect('a weak password for a reset is a 422 that does not repeat it', weakReset.status === 422 && !(await weakReset.text()).includes('tiny-pw-3'));
+    const resetRes = await post('/auth/users/new.analyst/password', boss, { new_password: resetPassword });
+    const resetText = await resetRes.text();
+    expect('an approver resets the password, and the answer holds no password', resetRes.status === 200 && JSON.parse(resetText).sessions_ended >= 1 && !resetText.includes(resetPassword) && !resetText.includes('scrypt$'), resetText.slice(0, 200));
+    expect('every session of that account ended', (await fetch(`${accBase}/alerts`, { headers: { Cookie: victim.cookie } })).status === 401);
+    expect('the password before the reset no longer signs in', (await signInAs('new.analyst', newAccountPassword)).status === 401);
+    expect('the password set by the reset signs in', (await signInAs('new.analyst', resetPassword)).status === 200);
+    expect('the approver stays signed in after resetting someone else', (await fetch(`${accBase}/auth/me`, { headers: { Cookie: boss.cookie } })).status === 200);
+
+    const authAudit = await (await fetch(`${accBase}/audit-logs?category=authentication&limit=200`, { headers: { Cookie: boss.cookie } })).json();
+    const authActions = new Set(authAudit.map((r) => r.action));
+    expect('the authentication filter lists sign-in, account and password events', ['LOGIN', 'LOGIN_FAILED', 'LOGOUT', 'ACCOUNT_CREATED', 'ACCOUNT_DISABLED', 'ACCOUNT_ENABLED', 'PASSWORD_CHANGED'].every((a) => authActions.has(a)), [...authActions].join());
+    expect('the authentication filter leaves out every other kind of event', authActions.size > 0 && ![...authActions].some((a) => !/^(LOGIN|LOGOUT|ACCOUNT_|PASSWORD_)/.test(a)), [...authActions].join());
+    const everyAudit = await (await fetch(`${accBase}/audit-logs?limit=200`, { headers: { Cookie: boss.cookie } })).text();
+    expect('the audit log holds no password and no hash', ![password, newAccountPassword, changedPassword, 'scrypt$'].some((secret) => everyAudit.includes(secret)));
+    const resetEntry = authAudit.find((r) => r.action === 'PASSWORD_RESET');
+    expect('the reset is in the authentication events, with the approver as actor and the account as target', Boolean(resetEntry) && resetEntry.actor === 'boss.approver' && resetEntry.target_id === 'new.analyst', JSON.stringify(resetEntry));
+    expect('the audit log does not hold the reset password', !everyAudit.includes(resetPassword));
   } catch (err) {
     failures.push(`accounts-mode check crashed: ${err.stack || err}`);
   } finally {
     if (acc && !acc.killed) acc.kill();
+    await new Promise((r) => setTimeout(r, 300));
+    fs.rmSync(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 });
+  }
+}
+
+// ---- first-run setup and the read-only guest, over real HTTP on an EMPTY database (no account exists) with ALLOW_GUEST on.
+async function firstRunAndGuestCheck() {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'socmind-first-'));
+  const frPort = await freePort();
+  const frBase = `http://127.0.0.1:${frPort}/api/v1`;
+  const adminPassword = crypto.randomBytes(18).toString('base64url');
+  const env = {
+    ...process.env,
+    THREAT_INTEL_PROVIDER: 'mock', THREAT_INTEL_MOCK_MODE: 'True', VIRUSTOTAL_API_KEY: '',
+    AUTH_MODE: 'accounts', AUTH_TOKENS: '[]', ENVIRONMENT: 'development', ALLOW_GUEST: 'true',
+    SESSION_IDLE_MINUTES: '30', SESSION_ABSOLUTE_HOURS: '8', LOGIN_MAX_FAILURES: '5', LOGIN_LOCK_MINUTES: '15',
+    DATABASE_URL: `sqlite:///${path.join(dir, 'first.db').replace(/\\/g, '/')}`,
+    PYTHONDONTWRITEBYTECODE: '1',
+  };
+  let fr = null;
+  let frLog = '';
+  const json = (cookie, csrfValue) => ({ 'Content-Type': 'application/json', ...(cookie ? { Cookie: cookie } : {}), ...(csrfValue ? { 'X-CSRF-Token': csrfValue } : {}) });
+  try {
+    fr = spawn(python, ['-m', 'uvicorn', 'app.main:app', '--host', '127.0.0.1', '--port', String(frPort), '--log-level', 'warning'], { cwd: backend, env });
+    fr.stdout.on('data', (d) => { frLog += d; });
+    fr.stderr.on('data', (d) => { frLog += d; });
+    let up = false;
+    for (let i = 0; i < 80 && !up; i += 1) {
+      try { up = (await fetch(`${frBase}/health`)).ok; } catch { await new Promise((r) => setTimeout(r, 250)); }
+    }
+    if (!up) throw new Error(`first-run backend did not start: ${frLog.slice(-600)}`);
+
+    const status = await (await fetch(`${frBase}/auth/status`)).json();
+    expect('an empty accounts installation asks for first-run setup', status.mode === 'accounts' && status.setup_required === true, JSON.stringify(status));
+    expect('the guest flag is on when ALLOW_GUEST is set', status.guest_allowed === true, JSON.stringify(status));
+    expect('nothing is readable before setup', (await fetch(`${frBase}/alerts`)).status === 401);
+
+    const setup = (body) => fetch(`${frBase}/auth/setup`, { method: 'POST', headers: json(), body: JSON.stringify(body) });
+    const mismatch = await setup({ username: 'first.admin', password: adminPassword, confirm: `${adminPassword}x` });
+    expect('setup with two different passwords is refused (422)', mismatch.status === 422 && !(await mismatch.text()).includes(adminPassword));
+    const weak = await setup({ username: 'first.admin', password: 'tiny-pw-4', confirm: 'tiny-pw-4' });
+    expect('setup with a weak password is refused (422) without repeating it', weak.status === 422 && !(await weak.text()).includes('tiny-pw-4'));
+    const missing = await setup({ username: 'first.admin', password: adminPassword });
+    expect('setup with a missing field is refused (422) without sending the password back', missing.status === 422 && !(await missing.text()).includes(adminPassword));
+    expect('a failed attempt leaves setup open', (await (await fetch(`${frBase}/auth/status`)).json()).setup_required === true);
+    const form = await fetch(`${frBase}/auth/setup`, { method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, body: `username=first.admin&password=${adminPassword}&confirm=${adminPassword}` });
+    expect('a cross-site form post cannot set up the first account', form.status === 415 || form.status === 422, String(form.status));
+
+    const made = await setup({ username: 'First.Admin', password: adminPassword, confirm: adminPassword });
+    const madeCookieHeader = made.headers.get('set-cookie') || '';
+    const madeText = await made.text();
+    const madeBody = made.status === 200 ? JSON.parse(madeText) : {};
+    expect('setup creates the first approver and signs them in', made.status === 200 && madeBody.name === 'first.admin' && madeBody.role === 'approver' && madeBody.authenticated === true, madeText.slice(0, 200));
+    expect('setup sets an HttpOnly, SameSite=Strict session cookie and returns a CSRF token', /HttpOnly/i.test(madeCookieHeader) && /SameSite=Strict/i.test(madeCookieHeader) && typeof madeBody.csrf_token === 'string' && madeBody.csrf_token.length >= 40);
+    expect('the setup answer holds no password and no hash', !madeText.includes(adminPassword) && !madeText.includes('scrypt$'));
+    const admin = { cookie: madeCookieHeader.split(';')[0], csrf: madeBody.csrf_token };
+    expect('the cookie from setup is a working session', (await fetch(`${frBase}/auth/me`, { headers: { Cookie: admin.cookie } })).status === 200);
+    const again = await setup({ username: 'second.admin', password: adminPassword, confirm: adminPassword });
+    expect('setup works once: the second attempt is 409', again.status === 409);
+    expect('setup is no longer offered', (await (await fetch(`${frBase}/auth/status`)).json()).setup_required === false);
+    const users = await (await fetch(`${frBase}/auth/users`, { headers: { Cookie: admin.cookie } })).json();
+    expect('exactly one account exists, an active approver', users.length === 1 && users[0].username === 'first.admin' && users[0].role === 'approver' && users[0].is_active === true, JSON.stringify(users));
+    const created = await (await fetch(`${frBase}/audit-logs?action=ACCOUNT_CREATED`, { headers: { Cookie: admin.cookie } })).json();
+    expect('setup is audited as ACCOUNT_CREATED via first_run_setup', created.length === 1 && created[0].actor === 'first.admin' && created[0].details && created[0].details.via === 'first_run_setup', JSON.stringify(created));
+    const reserved = await fetch(`${frBase}/auth/users`, { method: 'POST', headers: json(admin.cookie, admin.csrf), body: JSON.stringify({ username: 'guest', role: 'viewer', password: adminPassword }) });
+    expect('no account can be called guest', reserved.status === 422);
+
+    // ---- the guest
+    const guestRes = await fetch(`${frBase}/auth/guest`, { method: 'POST', headers: json(), body: '{}' });
+    const guestCookieHeader = guestRes.headers.get('set-cookie') || '';
+    const guestBody = guestRes.status === 200 ? await guestRes.json() : {};
+    expect('a guest session is a viewer called guest', guestRes.status === 200 && guestBody.name === 'guest' && guestBody.role === 'viewer' && guestBody.guest === true, JSON.stringify(guestBody));
+    expect('the guest cookie is HttpOnly and SameSite=Strict', /HttpOnly/i.test(guestCookieHeader) && /SameSite=Strict/i.test(guestCookieHeader));
+    const guest = { cookie: guestCookieHeader.split(';')[0], csrf: guestBody.csrf_token };
+    const guestMe = await (await fetch(`${frBase}/auth/me`, { headers: { Cookie: guest.cookie } })).json();
+    expect('the session check reports a guest', guestMe.guest === true && guestMe.name === 'guest' && guestMe.role === 'viewer', JSON.stringify(guestMe));
+    expect('a guest can read alerts, incidents and the audit log', (await Promise.all(['/alerts', '/incidents', '/audit-logs', '/stats'].map((p) => fetch(`${frBase}${p}`, { headers: { Cookie: guest.cookie } })))).every((r) => r.status === 200));
+    const writes = [
+      ['POST', '/alerts/seed'], ['POST', '/pipeline/run'], ['POST', '/incidents/correlate'], ['DELETE', '/alerts/NO-SUCH-ALERT'],
+      ['POST', '/incidents/NO-SUCH/approve'], ['POST', '/incidents/NO-SUCH/simulate'], ['GET', '/auth/users'],
+      ['POST', '/auth/users/first.admin/password'], ['POST', '/auth/users/first.admin/disable'],
+    ];
+    const refused = await Promise.all(writes.map(([method, p]) => fetch(`${frBase}${p}`, { method, headers: json(guest.cookie, guest.csrf), body: method === 'POST' ? '{}' : undefined })));
+    expect('a guest is refused (403) on every write and on account management', refused.every((r) => r.status === 403), refused.map((r) => r.status).join());
+    expect('a guest cannot change a password (403)', (await fetch(`${frBase}/auth/password`, { method: 'POST', headers: json(guest.cookie, guest.csrf), body: JSON.stringify({ current_password: 'x'.repeat(12), new_password: 'y'.repeat(12) }) })).status === 403);
+    expect('a guest write without the CSRF token is refused too (403)', (await fetch(`${frBase}/alerts/seed`, { method: 'POST', headers: { Cookie: guest.cookie } })).status === 403);
+    const guestAudit = await (await fetch(`${frBase}/audit-logs?action=LOGIN`, { headers: { Cookie: admin.cookie } })).json();
+    expect('the guest sign-in is audited with actor guest', guestAudit.some((r) => r.actor === 'guest'), JSON.stringify(guestAudit.map((r) => r.actor)));
+    const usersAfter = await (await fetch(`${frBase}/auth/users`, { headers: { Cookie: admin.cookie } })).json();
+    expect('a guest creates no account', usersAfter.length === 1);
+    const guestOut = await fetch(`${frBase}/auth/logout`, { method: 'POST', headers: json(guest.cookie, guest.csrf) });
+    expect('a guest signs out', guestOut.status === 200);
+    expect('the guest cookie is refused after sign-out', (await fetch(`${frBase}/alerts`, { headers: { Cookie: guest.cookie } })).status === 401);
+    const guestForm = await fetch(`${frBase}/auth/guest`, { method: 'POST', headers: { 'Content-Type': 'text/plain' }, body: 'x' });
+    expect('a cross-site form post cannot open a guest session', guestForm.status === 415 || guestForm.status === 422, String(guestForm.status));
+  } catch (err) {
+    failures.push(`first-run and guest check crashed: ${err.stack || err}`);
+  } finally {
+    if (fr && !fr.killed) fr.kill();
     await new Promise((r) => setTimeout(r, 300));
     fs.rmSync(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 });
   }
@@ -197,6 +391,7 @@ try {
       THREAT_INTEL_PROVIDER: 'mock',
       THREAT_INTEL_MOCK_MODE: 'True',
       VIRUSTOTAL_API_KEY: '',
+      AUTH_MODE: 'disabled', AUTH_TOKENS: '[]', ALLOW_GUEST: 'false',
       DATABASE_URL: `sqlite:///${path.join(tmp, 'it.db').replace(/\\/g, '/')}`,
       PYTHONDONTWRITEBYTECODE: '1',
     },
@@ -524,6 +719,7 @@ try {
   }
 
   await accountsModeCheck();
+  await firstRunAndGuestCheck();
   await tokenModeCheck();
   // ---- api.js and Settings by authentication mode (header check, real module)
   await (async () => {
@@ -587,6 +783,92 @@ try {
     absent('Settings in demo mode has no account card', demoOut, 'Signed-in account');
     const pendingOut = html(h(SettingsPage, { authMode: 'unknown' }));
     absent('Settings claims nothing about access before the mode is known', pendingOut, 'aria-label="Access token"', 'Signed-in account');
+
+    // Settings: account management and password change, by role and mode
+    const approverOut = html(h(SettingsPage, { authMode: 'accounts', account: { authenticated: true, name: 'boss.approver', role: 'approver', idle_timeout_minutes: 30 } }));
+    check('Settings shows an approver the Users section with the create-account form', approverOut, 'Users', 'Loading accounts...', 'Create account', 'Role for the new account', 'Confirm password');
+    check('Settings says there is no public sign-up', approverOut, 'there is no public sign-up');
+    check('Settings shows a signed-in account the change-password form', approverOut, 'Change password', 'Current password', 'Confirm new password', 'There is no reset by e-mail', 'ask an approver to reset it');
+    check('Settings shows an analyst the change-password form', accountOut, 'Change password', 'Current password');
+    absent('Settings hides the Users section from an analyst', accountOut, 'Create account', 'Loading accounts...', 'Role for the new account');
+    const viewerOut = html(h(SettingsPage, { authMode: 'accounts', account: { authenticated: true, name: 'vera.viewer', role: 'viewer', idle_timeout_minutes: 30 } }));
+    absent('Settings hides the Users section from a viewer', viewerOut, 'Create account', 'Loading accounts...');
+    absent('Settings in token mode has neither the Users section nor the password form', tokenOut, 'Create account', 'Change password');
+    absent('Settings in demo mode has neither the Users section nor the password form', demoOut, 'Create account', 'Change password');
+    absent('Settings before the mode is known has neither', pendingOut, 'Create account', 'Change password');
+
+    const UserParts = await server.ssrLoadModule('/src/components/UserManagement.jsx');
+    const sampleUsers = [
+      { username: 'boss.approver', role: 'approver', is_active: true, created_at: '2026-11-17T09:00:00Z' },
+      { username: 'ana.analyst', role: 'analyst', is_active: true, created_at: '2026-11-17T09:05:00Z' },
+      { username: 'old.viewer', role: 'viewer', is_active: false, created_at: '2026-11-17T09:10:00Z' },
+    ];
+    const tableProps = { users: sampleUsers, me: { name: 'boss.approver' }, onAskDisable: noop, onCancel: noop, onConfirmDisable: noop, onEnable: noop };
+    let tableOut = html(h(UserParts.UsersTable, tableProps));
+    check('the accounts table shows username, role, state and creation time', tableOut, 'boss.approver', '(you)', 'Approver', 'Analyst', 'Active', 'Disabled', '2026-11-17 09:05:00 UTC');
+    check('a disabled account offers Enable', tableOut, 'Enable');
+    expect('Disable is blocked for your own account, and says why', /disabled=""\s+title="You cannot disable your own account\."/.test(tableOut), tableOut.slice(0, 400));
+    absent('no confirmation is shown before Disable is pressed', tableOut, 'Confirm disable', 'Their open sessions end immediately');
+    tableOut = html(h(UserParts.UsersTable, { ...tableProps, confirming: 'ana.analyst' }));
+    check('pressing Disable asks first, naming the account and what disabling does', tableOut, 'Disable ana.analyst? Their open sessions end immediately', 'Confirm disable', 'Cancel');
+    tableOut = html(h(UserParts.UsersTable, { ...tableProps, me: { name: 'someone.else' }, users: sampleUsers.filter((u) => u.username !== 'ana.analyst') }));
+    expect('Disable is blocked for the last active approver, and says why', /disabled=""\s+title="The last active approver cannot be disabled\."/.test(tableOut), tableOut.slice(0, 400));
+    tableOut = html(h(UserParts.UsersTable, { ...tableProps, error: 'The last active approver cannot be disabled, because nobody could then manage accounts or approve responses.' }));
+    check('a refused change is shown next to the table', tableOut, 'The last active approver cannot be disabled, because nobody could then manage accounts');
+    const formOut = html(h(UserParts.CreateAccountForm, { form: { username: 'x', role: 'viewer', password: '', confirm: '' }, errors: { username: 'A username is 3 to 64 characters', confirm: 'The two passwords do not match.' }, onChange: () => noop, onSubmit: noop, error: 'That username already exists.', message: '' }));
+    check('the create-account form shows each field problem and the server answer', formOut, 'A username is 3 to 64 characters', 'The two passwords do not match.', 'That username already exists.', 'type="password"');
+    absent('the create-account form never prints a password into the page', formOut, 'value="a long');
+    const PasswordParts = await server.ssrLoadModule('/src/components/ChangePasswordCard.jsx');
+    const passwordOut = html(h(PasswordParts.ChangePasswordForm, { form: { current: '', next: '', confirm: '' }, errors: { current: 'Enter your current password.' }, onChange: () => noop, onSubmit: noop, error: 'The current password is incorrect.', message: 'Password changed. 1 other session was signed out.' }));
+    check('the change-password form shows its problems and its success message', passwordOut, 'Enter your current password.', 'The current password is incorrect.', 'Password changed. 1 other session was signed out.', 'type="password"', 'Change password');
+
+    // the session expiry warning, from the real component with a clock passed in
+    const Notice = (await server.ssrLoadModule('/src/components/SessionNotice.jsx')).default;
+    const t0 = 1_700_000_000_000;
+    const base = { session: { idle_timeout_minutes: 30, expires_in_seconds: 28800, receivedAt: t0 }, lastActivityAt: t0 };
+    absent('no expiry notice while the session has time', html(h(Notice, { ...base, now: t0 + 60_000 })), 'Your session', 'Stay signed in');
+    const idleNotice = html(h(Notice, { ...base, now: t0 + 28 * 60_000 }));
+    check('two minutes before the idle timeout the notice appears with Stay signed in', idleNotice, 'Your session will end in 2 minutes due to inactivity.', 'Stay signed in');
+    const absoluteNotice = html(h(Notice, { session: { idle_timeout_minutes: 30, expires_in_seconds: 300, receivedAt: t0 }, lastActivityAt: t0, now: t0 }));
+    check('five minutes before the absolute limit a notice appears', absoluteNotice, 'Your session reaches its time limit in 5 minutes');
+    absent('the absolute-limit notice offers no Stay signed in, because nothing extends it', absoluteNotice, 'Stay signed in');
+
+    // the sign-in page, the first-run page, the guest, and the approver's password reset
+    const LoginPage = (await server.ssrLoadModule('/src/pages/Login.jsx')).default;
+    const SetupParts = await server.ssrLoadModule('/src/pages/Setup.jsx');
+    const loginOut = html(h(LoginPage, { onSignedIn: noop }));
+    check('the sign-in page says to ask an approver when a password is forgotten', loginOut, 'Forgot your password? Ask an approver to reset it.', 'Sign in');
+    absent('the sign-in page has no guest button unless the server allows guests', loginOut, 'Continue as guest');
+    const guestLoginOut = html(h(LoginPage, { onSignedIn: noop, guestAllowed: true }));
+    check('the sign-in page offers the guest button when the server allows guests', guestLoginOut, 'Continue as guest (read-only)', 'Forgot your password?');
+    const setupOut = html(h(SetupParts.default, { onSignedIn: noop }));
+    check('the first-run page asks to create the first administrator account', setupOut, 'Create the first administrator account', 'Confirm password', 'Create account and sign in', 'type="password"', 'before anyone else can reach this address');
+    absent('the first-run page is not the sign-in page and offers no guest or role choice', setupOut, 'Sign in to SOCMind AI', 'Continue as guest', 'Role');
+    const setupErrOut = html(h(SetupParts.SetupForm, { form: { username: 'x', password: '', confirm: '' }, errors: { username: 'A username is 3 to 64 characters', confirm: 'The two passwords do not match.' }, error: 'An account already exists, so setup is closed.', onChange: () => noop, onSubmit: noop }));
+    check('the first-run form shows each field problem and the server answer', setupErrOut, 'A username is 3 to 64 characters', 'The two passwords do not match.', 'An account already exists, so setup is closed.');
+    absent('the first-run form never prints a password into the page', setupErrOut, 'value="a long');
+
+    const guestUser = { authenticated: true, name: 'guest', role: 'viewer', guest: true, idle_timeout_minutes: 30 };
+    check('the top bar says Guest (read-only)', html(h(Top.default, { activeTab: 'alerts', online: true, user: guestUser, mode: 'accounts', onSignOut: noop })), 'Guest (read-only)', 'Sign out');
+    const guestSettings = html(h(SettingsPage, { authMode: 'accounts', account: guestUser }));
+    check('Settings tells a guest the session is read-only and has no account', guestSettings, 'Guest session', 'Read-only', 'A guest has no account and no password');
+    absent('Settings gives a guest no password form, no Users section and no account card', guestSettings, 'Change password', 'Create account', 'Loading accounts...', 'Signed-in account');
+
+    let resetTable = html(h(UserParts.UsersTable, tableProps));
+    check('each account row offers Reset password', resetTable, 'Reset password');
+    expect('Reset password is blocked for your own account, and says why', /disabled=""\s+title="Use Change password for your own account\."/.test(resetTable), resetTable.slice(0, 600));
+    absent('no reset panel is shown before Reset password is pressed', resetTable, 'Confirm reset', 'Set a new password for');
+    resetTable = html(h(UserParts.UsersTable, { ...tableProps, onAskReset: noop, onResetChange: () => noop, onConfirmReset: noop, onCancelReset: noop, resetting: 'ana.analyst' }));
+    check('pressing Reset password asks first, naming the account and what a reset does', resetTable, 'Set a new password for ana.analyst? Every open session of ana.analyst ends at once', 'Confirm reset', 'Cancel', 'New password', 'Confirm new password', 'type="password"');
+    resetTable = html(h(UserParts.UsersTable, { ...tableProps, resetMessage: 'Password reset for "ana.analyst". 2 open sessions ended. Give them the new password in person; it is not shown again.' }));
+    check('a successful reset is reported without any password', resetTable, 'Password reset for &quot;ana.analyst&quot;. 2 open sessions ended.');
+    const panelOut = html(h(UserParts.ResetPasswordPanel, { username: 'ana.analyst', form: { next: '', confirm: '' }, errors: { next: 'The password must be at least 12 characters long.', confirm: 'The two passwords do not match.' }, error: 'No account has that username.', onChange: () => noop, onConfirm: noop, onCancel: noop }));
+    check('the reset panel shows each field problem and the server answer', panelOut, 'The password must be at least 12 characters long.', 'The two passwords do not match.', 'No account has that username.');
+    absent('the reset panel never prints a password into the page', panelOut, 'value="a long');
+
+    // the Audit Log's event-type filter
+    const auditOut = html(h(Audit.default, {}));
+    check('the Audit Log offers the Authentication events filter', auditOut, 'Filter by event type', 'All events', 'Authentication events');
   })();
 } catch (err) {
   failures.push(`integration run crashed: ${err.stack || err}`);

@@ -22,6 +22,12 @@ atexit.register(shutil.rmtree, _SESSION_DB_DIR, ignore_errors=True)
 os.environ["THREAT_INTEL_PROVIDER"] = "mock"
 os.environ["VIRUSTOTAL_API_KEY"] = ""
 
+# The authentication settings start from the application's defaults, whatever a developer keeps in backend/.env (for example
+# AUTH_MODE=accounts or a short SESSION_IDLE_MINUTES for trying the sign-in page). Tests that need another value set it themselves.
+for _name, _default in (("AUTH_MODE", "disabled"), ("AUTH_TOKENS", "[]"), ("SESSION_IDLE_MINUTES", "30"), ("SESSION_ABSOLUTE_HOURS", "8"),
+                        ("LOGIN_MAX_FAILURES", "5"), ("LOGIN_LOCK_MINUTES", "15"), ("ALLOW_GUEST", "false")):
+    os.environ[_name] = _default
+
 
 def pytest_sessionfinish(session, exitstatus):
     """Release the SQLite file (Windows cannot delete an open file) and remove the throw-away directory."""

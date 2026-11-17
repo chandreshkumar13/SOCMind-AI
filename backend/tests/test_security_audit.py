@@ -81,9 +81,11 @@ def test_a_disabled_account_gets_exactly_the_same_answer_as_a_wrong_password(iso
     assert wrong.json() == disabled.json() == unknown.json()
 
 
-def test_the_public_status_reveals_only_the_mode_and_whether_sign_in_is_used(iso_client, accounts_mode):
+def test_the_public_status_reveals_only_the_mode_and_what_the_sign_in_page_needs(iso_client, accounts_mode):
+    """No account name, count, role or setting beyond: the mode, whether to sign in, and whether setup or a guest button is offered."""
     body = iso_client.get(f"{API}/auth/status").json()
-    assert set(body) == {"mode", "login_required", "sign_in"}
+    assert set(body) == {"mode", "login_required", "sign_in", "setup_required", "guest_allowed"}
+    assert all(isinstance(value, (str, bool)) for value in body.values())
 
 
 def test_an_oversized_username_is_refused_without_a_server_error(iso_client, accounts_mode):

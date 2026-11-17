@@ -1,6 +1,8 @@
 import logging
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request
+from fastapi.encoders import jsonable_encoder
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 import uvicorn
@@ -11,7 +13,8 @@ from app.core.runtime import process_model_note, worker_processes
 from app.api.v1.router import api_router
 
 # A misconfigured token setup stops the application at startup instead of leaving it open or unusable
-validate_auth_config(settings.AUTH_MODE, settings.AUTH_TOKENS, settings.ENVIRONMENT, cookie_secure=session_cookie_secure())
+validate_auth_config(settings.AUTH_MODE, settings.AUTH_TOKENS, settings.ENVIRONMENT, cookie_secure=session_cookie_secure(),
+                     allow_guest=settings.ALLOW_GUEST)
 from app.db.session import init_db
 from app.services.threat_intel import resolve_provider
 
@@ -30,11 +33,17 @@ async def lifespan(app: FastAPI):
         from app.services import accounts as account_service
         db = SessionLocal()
         try:
-            if account_service.user_count(db) == 0:
-                logger.warning("AUTH_MODE=accounts and no active account exists yet. Create the first one with: "
-                               "python -m app.cli.accounts create-user --username NAME --role approver")
+            if account_service.setup_required(db):
+                logger.warning("AUTH_MODE=accounts and no account exists yet. Open the web page to create the first "
+                               "administrator (offered only while no account exists, so do it before anyone else can reach the "
+                               "server), or run: python -m app.cli.accounts create-user --username NAME --role approver")
+            elif account_service.user_count(db) == 0:
+                logger.warning("AUTH_MODE=accounts and every account is disabled. Enable one with: "
+                               "python -m app.cli.accounts enable-user --username NAME")
         finally:
             db.close()
+        if settings.ALLOW_GUEST:
+            logger.warning("ALLOW_GUEST is on: anyone who can reach the sign-in page can open a read-only guest session.")
     yield
 
 # Also ensure DB tables exist upon module import
@@ -66,6 +75,17 @@ logger = logging.getLogger("socmind")
 # httpx logs every request URL at INFO; keep indicator values and provider URLs out of the application log
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
+
+
+# Validation errors answer 422 as FastAPI does by default, except that the sign-in, account and password endpoints (/auth/...)
+# never send the submitted values back: the default answer repeats the whole request body for a missing field, and that body
+# holds a password.
+@app.exception_handler(RequestValidationError)
+async def validation_error_handler(request: Request, exc: RequestValidationError):
+    errors = exc.errors()
+    if request.url.path.startswith(f"{settings.API_V1_STR}/auth/"):
+        errors = [{key: value for key, value in error.items() if key != "input"} for error in errors]
+    return JSONResponse(status_code=422, content={"detail": jsonable_encoder(errors)})
 
 
 # Global Error Handler

@@ -119,7 +119,7 @@ refuses demo mode:
 SOCMIND_ENVIRONMENT=production AUTH_MODE=token AUTH_TOKENS='[...]' docker compose up --build
 ```
 
-In a production-like run the default demo mode makes the backend exit at startup, and so does `AUTH_MODE=token` without valid tokens. Keep real tokens out of Git. `AUTH_MODE=accounts` is also accepted by the backend, but the Compose file does not pass the `SESSION_*` and `LOGIN_*` settings and accounts mode has not been tried in Docker. The frontend is a development server, so this Compose file is not a production deployment on its own.
+In a production-like run the default demo mode makes the backend exit at startup, and so does `AUTH_MODE=token` without valid tokens. Keep real tokens out of Git. `AUTH_MODE=accounts` is also accepted by the backend, and the Compose file passes the `SESSION_*` and `LOGIN_*` settings with the application's defaults, but accounts mode has not been tried in Docker. The frontend is a development server, so this Compose file is not a production deployment on its own.
 
 **Not verified:** Docker is not installed in the environment where these files were written, so no image has been built or run.
 
@@ -142,18 +142,44 @@ AUTH_MODE=token
 AUTH_TOKENS=[{"name": "Ana Analyst", "role": "analyst", "token": "<at least 16 random characters>"}]
 ```
 
-**Accounts (sign-in with a password).** `AUTH_MODE=accounts` shows a sign-in page (and a **Sign out** button once signed in). Create the first account from the command line;
-the password is typed at a prompt, never passed as an argument:
+**Accounts (sign-in with a password).** `AUTH_MODE=accounts` shows a sign-in page (and a **Sign out** button once signed in). No account
+exists at first. The page then shows **Create the first administrator account** instead of the sign-in form: a username and a password
+typed twice make the first approver and sign them in. That form is offered only while there is no account at all (the server answers
+`409` to it afterwards), so create the account before anyone else can reach the address. The command line does the same, and also
+creates the other accounts; the password is typed at a prompt, never passed as an argument:
 
 ```
 cd backend
 python -m app.cli.accounts create-user --username ana.analyst --role analyst
+python -m app.cli.accounts reset-password --username ana.analyst
 python -m app.cli.accounts list-users
 ```
 
 Sessions last 30 minutes without use and 8 hours at most. Five failed sign-ins for one name and address lock that pair for 15
 minutes. The session cookie is `HttpOnly` and `SameSite=Strict`, and it is `Secure` outside development. Deploy behind HTTPS with
 the frontend and the API on the same site. The full rules and their limits are in [docs/SECURITY.md](docs/SECURITY.md).
+
+**Managing accounts and passwords (accounts mode).** Signed in as an approver, **Settings → Users** lists the accounts, creates
+one (username, role, and a password typed twice) and disables or enables one. Disabling ends that account's sessions at once; you
+cannot disable your own account, and the last active approver cannot be disabled. Every signed-in account can change its own
+password under **Settings → Change password**: the current password is required, and the account's other sessions are signed out.
+A forgotten password is handled by an approver: **Settings → Users → Reset password** (a new password typed twice, after a
+confirmation) sets it, ends every session of that account and clears its sign-in lockout; the approver then gives the person the new
+password in person. An approver cannot reset their own password that way, and uses **Change password** instead. The sign-in page says
+"Forgot your password? Ask an approver to reset it." The same actions are available through the API (`GET /auth/users`,
+`POST /auth/users`, `POST /auth/users/{username}/disable` and `/enable`, `POST /auth/users/{username}/password`, `POST /auth/password`,
+`POST /auth/setup`; see [docs/API.md](docs/API.md)). Two minutes before a
+session would end for inactivity, the page shows "Your session will end in 2 minutes due to inactivity" with a **Stay signed in**
+button, and five minutes before the 8-hour limit it shows a notice. The Audit Log has an **Authentication events** filter (sign-in,
+sign-out, account, password change and password reset events). There is **no public sign-up** (only the first-run page, once), **no
+password reset by e-mail**, and **no multi-factor authentication**.
+
+**Optional read-only guest.** `ALLOW_GUEST=true` (accounts mode only, **off by default**) adds **Continue as guest (read-only)** to the
+sign-in page. A guest is a viewer called "guest" with a short-lived session and no account and no password: it can read alerts,
+incidents and the audit log and can change nothing (every route that needs the analyst or approver role answers `403`), and the top
+bar says "Guest (read-only)". It is meant for a private demo, because anyone who can reach the page can read the data, so the backend
+**refuses to start** with `ALLOW_GUEST=true` unless `ENVIRONMENT` is `development` or `test`. Guest sessions are kept in the
+backend's memory (they end when it restarts). See [docs/SECURITY.md](docs/SECURITY.md).
 
 Static tokens from `AUTH_TOKENS` still work in accounts mode, for automation. In token mode, Settings has an *Access* card where a token can be entered for the browser tab (kept in `sessionStorage`, cleared when the tab closes); in accounts mode it shows the signed-in account and its session limits instead.
 
@@ -264,8 +290,13 @@ unverified); the Docker images were never built or run (Docker is not installed 
   `X-CSRF-Token` header (the web page sends it for you).
 - **`429` when signing in**: five failed sign-ins for one username and address lock that pair for 15 minutes, and the lock also
   refuses the correct password. Wait, then sign in again.
-- **Cannot sign in because no account exists**: accounts mode starts with no accounts. From `backend/`, run
-  `python -m app.cli.accounts create-user --username NAME --role analyst`.
+- **Cannot sign in because no account exists**: accounts mode starts with no accounts. Open the page and use *Create the first
+  administrator account*, or from `backend/` run `python -m app.cli.accounts create-user --username NAME --role approver`. If
+  accounts exist but every one is disabled, the first-run page is not offered (any account closes it); run
+  `python -m app.cli.accounts enable-user --username NAME`.
+- **Forgot a password**: an approver resets it under Settings → Users, or `python -m app.cli.accounts reset-password --username NAME`.
+- **Backend refuses to start with "ALLOW_GUEST=true is refused ..."**: guest access is only allowed for `ENVIRONMENT=development`
+  or `test`. Remove `ALLOW_GUEST` or set it to `false`.
 - **Backend refuses to start with "AUTH_MODE is 'token' but ..."**: fix `AUTH_TOKENS` (at least one entry, a role of viewer,
   analyst or approver, and a token of 16 or more characters).
 - **Backend refuses to start with "AUTH_MODE=disabled is refused ..."**: demo mode is only allowed for `ENVIRONMENT=development`
@@ -288,8 +319,9 @@ The full model is in [docs/SECURITY.md](docs/SECURITY.md). In short:
   also work in accounts mode, for automation.
 - **Accounts mode is a basic sign-in, not a full identity system.** Passwords are hashed with scrypt, sessions end after 30
   minutes without use and at most 8 hours after sign-in, five failed sign-ins lock a username and address pair for 15 minutes,
-  and writes made with the cookie need a CSRF header. There is no password reset, no multi-factor authentication and no
-  self-service registration. The lockout does not stop an attack spread over many addresses, and the client address is the
+  and writes made with the cookie need a CSRF header. There is no password reset by e-mail (an approver resets a forgotten password), no
+  multi-factor authentication and no self-service registration (an approver creates every account; the first-run page works only while
+  no account exists, so whoever reaches an empty installation first creates its first administrator). The lockout does not stop an attack spread over many addresses, and the client address is the
   connection's address (`X-Forwarded-For` is not trusted). It needs HTTPS and the frontend and API on the same site
   (`SameSite=Strict`). It is covered by the automated tests; no browser was driven against it.
 - Threat intelligence is mock data unless you enable VirusTotal; live verdicts are third-party opinions and can be wrong.
@@ -333,10 +365,13 @@ made the commit, so this lists commits, not who wrote each line.
 - Audit log export to CSV (`5569142`)
 - Alert status filter, close action and end-to-end workflow test (`71b5afc`, PR #5)
 
-**Kalpna Chaudhary** (1 commit)
+**Kalpna Chaudhary** (2 commits)
 
 - Login and logout authentication (`9c3a1df`, PR #4): accounts mode with username and password sign-in, scrypt password hashing,
   session cookies with CSRF protection and sign-in lockout, a command line to create accounts, the Login page and tests
+- Login improvements (branch `kalpna/login-improvements`): account management by an approver (create, disable, enable), change
+  password, a session expiry warning, the Authentication events audit filter, the Compose settings for accounts mode,
+  first-run setup of the first administrator, password reset by an approver, and an optional read-only guest
 
 ## Project team
 

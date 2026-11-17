@@ -1,5 +1,5 @@
 import json
-from typing import List, Optional
+from typing import List, Literal, Optional
 
 from fastapi import APIRouter, Depends, Query
 from sqlalchemy.orm import Session
@@ -7,6 +7,7 @@ from sqlalchemy.orm import Session
 from app.db.session import get_db
 from app.models.models import AuditLogModel
 from app.schemas.audit import AuditLogResponse
+from app.services.audit import AUTH_EVENT_ACTIONS
 
 router = APIRouter()
 
@@ -27,6 +28,8 @@ def list_audit_logs(
     actor: Optional[str] = Query(None, description="Filter by actor (analyst name or agent name)"),
     action: Optional[str] = Query(None, description="Filter by action name"),
     target_id: Optional[str] = Query(None, description="Filter by alert or incident id"),
+    category: Optional[Literal["authentication"]] = Query(
+        None, description="authentication: only sign-in, sign-out, account and password events (combines with the other filters)"),
     limit: int = Query(50, ge=1, le=200),
     offset: int = Query(0, ge=0),
     db: Session = Depends(get_db),
@@ -39,5 +42,7 @@ def list_audit_logs(
         q = q.filter(AuditLogModel.action == action.upper())
     if target_id:
         q = q.filter(AuditLogModel.target_id == target_id)
+    if category == "authentication":
+        q = q.filter(AuditLogModel.action.in_(AUTH_EVENT_ACTIONS))
     rows = q.order_by(AuditLogModel.id.desc()).offset(offset).limit(limit).all()
     return [_to_response(r) for r in rows]

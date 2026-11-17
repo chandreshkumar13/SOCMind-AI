@@ -58,7 +58,8 @@ def csrf_headers(login_response):
 # ----------------------------------------------------------------------------------- public and basic behaviour
 def test_status_is_public_and_tells_the_page_to_show_sign_in(iso_client, accounts_mode):
     body = iso_client.get(f"{API}/auth/status").json()
-    assert body == {"mode": "accounts", "login_required": True, "sign_in": True}
+    # a database with no account yet: the page is told to offer first-run setup (see test_first_run_setup.py)
+    assert body == {"mode": "accounts", "login_required": True, "sign_in": True, "setup_required": True, "guest_allowed": False}
 
 
 def test_a_protected_route_without_a_session_says_to_sign_in(iso_client, accounts_mode):

@@ -63,6 +63,9 @@ class Settings(BaseSettings):
     LOGIN_LOCK_MINUTES: int = 15             # ... lock that pair for this long
     # None = the session cookie is Secure outside development and test (required in production). False is refused in production.
     SESSION_COOKIE_SECURE: Optional[bool] = None
+    # Accounts mode only: lets the sign-in page offer "Continue as guest (read-only)". A guest is a viewer called "guest" with a
+    # short-lived session kept in memory; it has no account. Off by default. Refused outside development and test.
+    ALLOW_GUEST: bool = False
 
     # Logging
     LOG_LEVEL: str = "INFO"

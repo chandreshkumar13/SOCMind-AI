@@ -11,6 +11,12 @@ from sqlalchemy.orm import Session
 
 from app.models.models import AuditLogModel
 
+# What the sign-in system records. GET /audit-logs?category=authentication returns exactly these actions.
+AUTH_EVENT_ACTIONS = (
+    "LOGIN", "LOGIN_FAILED", "LOGIN_LOCKED", "LOGOUT",
+    "ACCOUNT_CREATED", "ACCOUNT_DISABLED", "ACCOUNT_ENABLED", "PASSWORD_CHANGED", "PASSWORD_RESET",
+)
+
 
 def log_action(db: Session, actor: str, action: str, target_id: Optional[str], details: Any = None) -> AuditLogModel:
     entry = AuditLogModel(

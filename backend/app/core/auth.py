@@ -23,7 +23,7 @@ from sqlalchemy.orm import Session
 
 from app.core.config import settings
 from app.db.session import get_db
-from app.services import accounts
+from app.services import accounts, guest
 
 ROLE_RANK = {"viewer": 0, "analyst": 1, "approver": 2}
 MIN_TOKEN_LENGTH = 16
@@ -40,6 +40,7 @@ class Principal:
     session_id: Optional[str] = None
     csrf_token: Optional[str] = None
     expires_at: Optional[datetime] = None   # absolute expiry of a cookie session (naive UTC)
+    guest: bool = False          # True for the read-only guest session (ALLOW_GUEST): a viewer named "guest" with no account
 
     @property
     def authenticated(self) -> bool:
@@ -81,7 +82,7 @@ def _check_static_tokens(tokens: List[Any]) -> None:
 
 
 def validate_auth_config(mode: str, tokens: List[Dict[str, Any]], environment: str = "development",
-                         cookie_secure: Optional[bool] = None) -> None:
+                         cookie_secure: Optional[bool] = None, allow_guest: bool = False) -> None:
     """Refuses a configuration that would silently leave the API open or unusable. Raises ValueError with the reason.
 
     Error messages never include a token value or a password."""
@@ -102,6 +103,11 @@ def validate_auth_config(mode: str, tokens: List[Dict[str, Any]], environment: s
     # accounts: people sign in with a password. Static tokens are optional here (for automation), but if given they must be valid.
     if env not in OPEN_MODE_ENVIRONMENTS and cookie_secure is False:
         raise ValueError("SESSION_COOKIE_SECURE=false is refused outside development and test: session cookies must be Secure (HTTPS).")
+    if allow_guest and env not in OPEN_MODE_ENVIRONMENTS:
+        # Like demo mode, a way in without a password is for development and test only.
+        raise ValueError(
+            f"ALLOW_GUEST=true is refused because ENVIRONMENT is {str(environment)!r}. Guest access (read-only, no password) is only "
+            "allowed for ENVIRONMENT=development or test. For any other environment leave ALLOW_GUEST unset or false.")
     if tokens:
         _check_static_tokens(tokens)
 
@@ -129,7 +135,8 @@ def current_principal(request: Request, db: Session = Depends(get_db)) -> Princi
     Accounts mode: a valid account session cookie is checked first and takes precedence. If the request also carries a bearer
     token, the cookie's account is still the identity, so the reviewer and the role are the account's. A write made with a
     cookie must carry the session's CSRF token. A static bearer token is used only when no valid cookie session exists, so
-    automation keeps working alongside people who sign in.
+    automation keeps working alongside people who sign in. With ALLOW_GUEST a cookie may also be a guest session: a viewer named
+    "guest" (never more than read access, so every analyst and approver route answers 403).
     """
     mode = settings.AUTH_MODE
     if mode == "disabled":
@@ -139,15 +146,20 @@ def current_principal(request: Request, db: Session = Depends(get_db)) -> Princi
         cookie = request.cookies.get(accounts.SESSION_COOKIE, "")
         if cookie:
             found = accounts.session_for_token(db, cookie)
-            if found is not None:
-                row, user = found
+            # A guest session is looked up only when guests are allowed, and only when the cookie is not an account session.
+            guest_row = guest.session_for_token(cookie) if found is None and settings.ALLOW_GUEST else None
+            if found is not None or guest_row is not None:
                 expected_csrf = accounts.csrf_for_token(cookie)
                 if request.method in STATE_CHANGING_METHODS:
                     sent = request.headers.get(accounts.CSRF_HEADER, "")
                     if not hmac.compare_digest(sent.encode("utf-8"), expected_csrf.encode("utf-8")):
                         raise HTTPException(status.HTTP_403_FORBIDDEN, "A valid CSRF token is required for this request.")
-                return Principal(name=user.username, role=user.role, mode="accounts", session=True, session_id=row.id,
-                                 csrf_token=expected_csrf, expires_at=row.absolute_expires_at)
+                if found is not None:
+                    row, user = found
+                    return Principal(name=user.username, role=user.role, mode="accounts", session=True, session_id=row.id,
+                                     csrf_token=expected_csrf, expires_at=row.absolute_expires_at)
+                return Principal(name=guest.GUEST_NAME, role="viewer", mode="accounts", session=True, session_id=guest_row.id,
+                                 csrf_token=expected_csrf, expires_at=guest_row.absolute_expires_at, guest=True)
         # no valid session: a static bearer token, as in token mode
         if presented:
             principal = _static_token_principal(presented)

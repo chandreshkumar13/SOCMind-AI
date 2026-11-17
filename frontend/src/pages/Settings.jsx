@@ -1,10 +1,13 @@
 import React, { useState } from 'react';
 import { Sliders, Shield, Database, RefreshCw } from 'lucide-react';
 import { ActionButton, ErrorCard, LoadingCard } from '../components/StateCards';
+import ChangePasswordCard from '../components/ChangePasswordCard';
+import UserManagement from '../components/UserManagement';
 import { api, API_BASE, readStoredToken, storeToken } from '../api';
 import useAsync from '../lib/useAsync';
 import { describeAccessError, formatUtc } from '../lib/view';
 import { roleLabel, settingsAccessView } from '../lib/session';
+import { canChangePassword, canManageUsers } from '../lib/accountForms';
 
 const row = { display: 'flex', justifyContent: 'space-between', gap: '16px', padding: '8px 0', borderBottom: '1px solid var(--border-color)', fontSize: '13px' };
 const label = { color: 'var(--text-muted)' };
@@ -90,6 +93,16 @@ function AccountCard({ account }) {
       </div>
     );
   }
+  if (account.guest) {
+    return (
+      <div className="glass-card" style={{ marginBottom: '20px' }}>
+        <h3 style={{ fontSize: '15px', marginBottom: '8px' }}>Guest session</h3>
+        <Row name="Access" value="Read-only" note="A guest can look at alerts, incidents and the audit log, and cannot change anything. A guest has no account and no password. Sign out, then sign in, to work with an account." />
+        <Row name="Session" value={account.idle_timeout_minutes ? `Ends after ${account.idle_timeout_minutes} minutes without use` : 'Ends after inactivity'}
+          note={account.expires_at ? `At the latest at ${formatUtc(account.expires_at)}.` : undefined} />
+      </div>
+    );
+  }
   return (
     <div className="glass-card" style={{ marginBottom: '20px' }}>
       <h3 style={{ fontSize: '15px', marginBottom: '8px' }}>Signed-in account</h3>
@@ -114,6 +127,8 @@ export default function Settings({ authMode = 'unknown', account = null }) {
       </div>
 
       {settingsAccessView(authMode) === 'account' && <AccountCard account={account} />}
+      {settingsAccessView(authMode) === 'account' && canChangePassword(account) && <ChangePasswordCard />}
+      {canManageUsers(account, authMode) && <UserManagement account={account} />}
       {(settingsAccessView(authMode) === 'token' || settingsAccessView(authMode) === 'demo') && <AccessCard />}
 
       {loading && !cfg && <LoadingCard>Loading configuration...</LoadingCard>}

@@ -2,16 +2,18 @@ import React, { useState, useEffect, useCallback, useRef } from 'react';
 import Sidebar from './components/Sidebar';
 import Topbar from './components/Topbar';
 import { ErrorCard, LoadingCard } from './components/StateCards';
+import SessionNotice from './components/SessionNotice';
 import Login from './pages/Login';
+import Setup from './pages/Setup';
 import Dashboard from './pages/Dashboard';
 import Alerts from './pages/Alerts';
 import Incidents from './pages/Incidents';
 import AgentActivity from './pages/AgentActivity';
 import AuditLog from './pages/AuditLog';
 import Settings from './pages/Settings';
-import { api, apiPage, SIGNED_OUT_EVENT, setAuthMode, setCsrfToken, storeToken } from './api';
+import { api, apiPage, noteActivity, SIGNED_OUT_EVENT, setAuthMode, setCsrfToken, storeToken } from './api';
 import { appendPage } from './lib/view.js';
-import { signInRequired, signOutOutcome } from './lib/session';
+import { guestAllowed, setupRequired, signInRequired, signOutOutcome } from './lib/session';
 
 export default function App() {
   const [activeTab, setActiveTab] = useState('dashboard');
@@ -26,9 +28,10 @@ export default function App() {
   const [alertsTotal, setAlertsTotal] = useState(null);       // matching alerts on the server (X-Total-Count)
   const [incidentsTotal, setIncidentsTotal] = useState(null);
   const [loadingMore, setLoadingMore] = useState(null);       // 'alerts' | 'incidents' while a next page is fetched
-  // phase: 'checking' (asking the server whether sign-in is needed), 'signin' (show the sign-in page), 'ready' (show the app).
-  // Nothing is loaded from the API until the phase is 'ready'.
-  const [auth, setAuth] = useState({ phase: 'checking', mode: null, signInRequired: false, user: null });
+  // phase: 'checking' (asking the server whether sign-in is needed), 'setup' (no account exists yet: create the first administrator),
+  // 'signin' (show the sign-in page), 'ready' (show the app). Nothing is loaded from the API until the phase is 'ready'.
+  // guestAllowed: the sign-in page offers "Continue as guest (read-only)" (the server's ALLOW_GUEST).
+  const [auth, setAuth] = useState({ phase: 'checking', mode: null, signInRequired: false, user: null, guestAllowed: false });
   const [signOutError, setSignOutError] = useState('');       // shown when the server did not confirm sign-out
   const accountsRef = useRef(false);
   accountsRef.current = auth.signInRequired;
@@ -148,17 +151,24 @@ export default function App() {
         if (!cancelled) setAuth({ phase: 'ready', mode: status.mode, signInRequired: false, user: null });
         return;
       }
+      const guests = guestAllowed(status);
+      if (setupRequired(status)) {
+        // No account exists, so there can be no session: offer the first-run form instead of the sign-in page
+        if (!cancelled) setAuth({ phase: 'setup', mode: status.mode, signInRequired: true, user: null, guestAllowed: false });
+        return;
+      }
       try {
         const me = await api('/auth/me');
         if (cancelled) return;
         if (me.authenticated && me.mode === 'accounts') {
           setCsrfToken(me.csrf_token);
-          setAuth({ phase: 'ready', mode: status.mode, signInRequired: true, user: me });
+          // receivedAt: when the server's session timing arrived, for the expiry warning (see components/SessionNotice.jsx)
+          setAuth({ phase: 'ready', mode: status.mode, signInRequired: true, user: { ...me, receivedAt: Date.now() }, guestAllowed: guests });
         } else {
-          setAuth({ phase: 'signin', mode: status.mode, signInRequired: true, user: null });
+          setAuth({ phase: 'signin', mode: status.mode, signInRequired: true, user: null, guestAllowed: guests });
         }
       } catch {
-        if (!cancelled) setAuth({ phase: 'signin', mode: status.mode, signInRequired: true, user: null });
+        if (!cancelled) setAuth({ phase: 'signin', mode: status.mode, signInRequired: true, user: null, guestAllowed: guests });
       }
     })();
     return () => { cancelled = true; };
@@ -184,7 +194,8 @@ export default function App() {
 
   const handleSignedIn = useCallback((session) => {
     setSignOutError('');
-    setAuth({ phase: 'ready', mode: 'accounts', signInRequired: true, user: session });
+    noteActivity();                  // signing in starts the idle clock
+    setAuth((current) => ({ ...current, phase: 'ready', mode: 'accounts', signInRequired: true, user: { ...session, receivedAt: Date.now() } }));
   }, []);
 
   // Only a confirmed revocation (or a session that had already ended on the server) clears the page. Anything else keeps the user
@@ -212,7 +223,8 @@ export default function App() {
       </div>
     );
   }
-  if (auth.phase === 'signin') return <Login onSignedIn={handleSignedIn} />;
+  if (auth.phase === 'setup') return <Setup onSignedIn={handleSignedIn} />;
+  if (auth.phase === 'signin') return <Login onSignedIn={handleSignedIn} guestAllowed={auth.guestAllowed} />;
 
   return (
     <div className="app-container">
@@ -220,6 +232,7 @@ export default function App() {
       <div className="main-content">
         <Topbar activeTab={activeTab} online={online} user={auth.user} mode={auth.mode} onSignOut={auth.signInRequired ? signOut : null} />
         <main className="page-wrapper">
+          {auth.signInRequired && auth.user && <SessionNotice session={auth.user} />}
           {signOutError && <ErrorCard title="Sign-out did not complete" message={signOutError} onRetry={signOut} />}
           {activeTab === 'dashboard' && <Dashboard alerts={alerts} incidents={incidents} stats={stats} setActiveTab={setActiveTab} />}
           {activeTab === 'alerts' && (

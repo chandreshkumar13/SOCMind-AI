@@ -1,5 +1,5 @@
 import { describeError } from './lib/view.js';
-import { requestHeaders, signedOutAfter } from './lib/session.js';
+import { countsAsActivity, requestHeaders, signedOutAfter } from './lib/session.js';
 
 // Two ways to prove who is calling, depending on the backend's AUTH_MODE (the app sets the mode from /auth/status before it
 // requests any protected data):
@@ -19,6 +19,16 @@ export function setAuthMode(mode) {
 }
 export function getAuthMode() {
   return authMode;
+}
+
+// When this page last got an answer that used the account session (accounts mode). The server's idle timeout runs from the same
+// moment, so the page uses it to warn before the session ends (see components/SessionNotice.jsx).
+let lastActivityAt = Date.now();
+export function noteActivity(at = Date.now()) {
+  lastActivityAt = at;
+}
+export function getLastActivity() {
+  return lastActivityAt;
 }
 
 let csrfToken = '';
@@ -92,6 +102,7 @@ async function request(path, { method = 'GET', body } = {}) {
   } catch {
     throw new ApiError(`Cannot reach the backend at ${API_BASE}. Is the FastAPI server running?`, 0);
   }
+  if (countsAsActivity({ mode: authMode, status: res.status, path })) lastActivityAt = Date.now();
   let data = null;
   try {
     data = await res.json();

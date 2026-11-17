@@ -2,6 +2,7 @@ import React, { useState } from 'react';
 import { LogIn } from 'lucide-react';
 import { api, setCsrfToken } from '../api';
 import { canSubmitSignIn, signInErrorMessage } from '../lib/session';
+import { FORGOT_PASSWORD_NOTE } from '../lib/accountForms';
 
 const input = { padding: '10px 12px', borderRadius: 'var(--radius-sm)', border: '1px solid var(--border-color)', background: 'var(--bg-dark)', color: 'var(--text-main)', fontSize: '14px', width: '100%' };
 const label = { display: 'flex', flexDirection: 'column', gap: '6px', fontSize: '12px', color: 'var(--text-muted)' };
@@ -9,13 +10,29 @@ const label = { display: 'flex', flexDirection: 'column', gap: '6px', fontSize: 
 /**
  * The sign-in page. It is the only thing shown until the server confirms a session, so nothing about the data is loaded before
  * sign-in. The password is cleared from the page as soon as the request starts; nothing is stored in the browser.
+ * "Continue as guest (read-only)" is offered only when the server says guests are allowed (`guestAllowed`).
  */
-export default function Login({ onSignedIn }) {
+export default function Login({ onSignedIn, guestAllowed = false }) {
   const [username, setUsername] = useState('');
   const [password, setPassword] = useState('');
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
   const ready = canSubmitSignIn({ username, password }) && !busy;
+
+  const continueAsGuest = async () => {
+    if (busy) return;
+    setBusy(true);
+    setError('');
+    try {
+      const session = await api('/auth/guest', { method: 'POST', body: {} });
+      setCsrfToken(session.csrf_token);
+      onSignedIn(session);
+    } catch (err) {
+      setError(err.message || 'A guest session could not be opened.');
+    } finally {
+      setBusy(false);
+    }
+  };
 
   const submit = async (event) => {
     event.preventDefault();
@@ -65,6 +82,16 @@ export default function Login({ onSignedIn }) {
           }}>
           <LogIn size={14} /> {busy ? 'Signing in...' : 'Sign in'}
         </button>
+        {guestAllowed && (
+          <button type="button" onClick={continueAsGuest} disabled={busy}
+            style={{
+              padding: '10px 14px', borderRadius: 'var(--radius-sm)', border: '1px solid var(--border-color)', background: 'transparent',
+              color: 'var(--text-main)', fontWeight: 600, fontSize: '13px', cursor: busy ? 'not-allowed' : 'pointer', opacity: busy ? 0.5 : 1,
+            }}>
+            Continue as guest (read-only)
+          </button>
+        )}
+        <p style={{ fontSize: '12px', color: 'var(--text-muted)' }}>{FORGOT_PASSWORD_NOTE}</p>
       </form>
     </div>
   );

@@ -14,7 +14,8 @@ Base URL: `http://localhost:8000/api/v1`. Interactive documentation generated fr
     role is too low, or a cookie write without the CSRF token.
   - Roles: **viewer** (read), **analyst** (ingest, triage, enrich, close, seed, pipeline, correlate, investigate,
     recommend, simulate), **approver** (approve, reject).
-  - `GET /auth/me` returns the caller's `mode`, `authenticated`, `name` and `role` (and, for a cookie session, the CSRF token).
+  - `GET /auth/me` returns the caller's `mode`, `authenticated`, `name` and `role` (`guest: true` for a guest session; and, for a cookie session, the CSRF token,
+    `idle_timeout_minutes`, `expires_at` and `expires_in_seconds`, the seconds left until the absolute session limit).
 - **List totals.** `GET /alerts` and `GET /incidents` set the `X-Total-Count` header to the number of records matching the
   filters (not just this page). The header is exposed to browsers through CORS.
 - Errors: `{"detail": "..."}` for 404 / 409 / 422 / 502. Unexpected server errors return HTTP 500 with a generic
@@ -26,9 +27,17 @@ Base URL: `http://localhost:8000/api/v1`. Interactive documentation generated fr
 | --- | --- | --- |
 | GET | `/health` | Liveness, environment, database **engine** (never the connection string). Public (no token). |
 | GET | `/auth/me` | Who the caller is: mode, name and role |
-| GET | `/auth/status` | How the server signs people in (`mode`, `login_required`, `sign_in`). Public |
+| GET | `/auth/status` | How the server signs people in (`mode`, `login_required`, `sign_in`), whether first-run setup is needed (`setup_required`: accounts mode with no account at all) and whether a guest button is offered (`guest_allowed`: accounts mode with `ALLOW_GUEST`). Public |
 | POST | `/auth/login` | Accounts mode only (404 in other modes). JSON body with `username` and `password`: sets the session cookie and returns the CSRF token. `401` for wrong credentials, `429` while locked out |
+| POST | `/auth/setup` | Accounts mode only, public, **only while no account exists** (any account, active or disabled, makes it `409` for good). JSON `username`, `password`, `confirm`: creates the first approver and signs them in like `/auth/login`. `422` for a bad username or password or two different passwords |
+| POST | `/auth/guest` | Accounts mode with `ALLOW_GUEST=true` only (404 otherwise). JSON `{}`: opens a read-only guest session (name `guest`, role `viewer`) with a cookie and CSRF token like `/auth/login` |
 | POST | `/auth/logout` | End the current session (a cookie session sends `X-CSRF-Token`) |
+| GET | `/auth/users` | Accounts mode, approver. List accounts: `username`, `role`, `is_active`, `created_at`. Never a password or hash |
+| POST | `/auth/users` | Accounts mode, approver. Create an account from `username`, `role`, `password`. `201`; `409` duplicate username; `422` bad username, role or password |
+| POST | `/auth/users/{username}/disable` | Accounts mode, approver. Disable an account and end its sessions. `409` for your own account or the last active approver; `404` unknown name |
+| POST | `/auth/users/{username}/enable` | Accounts mode, approver. Enable a disabled account |
+| POST | `/auth/users/{username}/password` | Accounts mode, approver. Set a new password for another account from `new_password`; ends all that account's sessions and clears its lockout. `409` for your own account; `404` unknown name; `422` password refused |
+| POST | `/auth/password` | Accounts mode, any signed-in account. Change your own password from `current_password` and `new_password`. `401` wrong current password; `429` locked out; `422` new password refused |
 | GET | `/version` | Version and runtime information |
 | GET | `/config` | Non-secret runtime configuration (threat-intel mode, execution mode, authentication status) |
 | GET | `/stats` | True totals computed in the database (alerts by severity/status, incidents, awaiting review, audit count) |
@@ -50,7 +59,51 @@ Base URL: `http://localhost:8000/api/v1`. Interactive documentation generated fr
 | POST | `/pipeline/run` | Run Triage → Enrichment → Correlation → Investigation → Response |
 | GET | `/pipeline/runs` | Recent run reports (`limit` 1-50, default 10) |
 | GET | `/agents` | Per-agent activity derived from the audit log. `status` is `IDLE` (no activity recorded), `ACTIVE` (has acted) or `ATTENTION` (a failure is recorded). It is not a health guarantee. |
-| GET | `/audit-logs` | Audit entries, newest first. Query: `actor`, `action`, `target_id`, `limit` (1-200, default 50), `offset` |
+| GET | `/audit-logs` | Audit entries, newest first. Query: `actor`, `action`, `target_id`, `category` (`authentication`: sign-in, sign-out, account and password events), `limit` (1-200, default 50), `offset` |
+
+## Accounts (accounts mode)
+
+These routes exist only when `AUTH_MODE=accounts`; in the other modes they answer `404`. They follow the usual order of checks:
+no session is `401`, a role that is too low is `403`, and a write made with the session cookie needs the `X-CSRF-Token` header.
+There is no public sign-up: every account is created by a signed-in approver, except the first one (see `POST /auth/setup` below).
+
+`POST /auth/setup` (public) takes `{"username", "password", "confirm"}` and works only while the account table is empty. It creates one
+`approver`, starts a session exactly as `/auth/login` does (cookie, CSRF token, `expires_in_seconds`) and answers `200` with the same body.
+Once any account exists, even a disabled one, it answers `409` `"Setup is already complete."` whatever is sent, before the body is looked at.
+The check and the insert are one SQL statement, so two simultaneous requests create one account. `422` for a bad username, a refused
+password, the reserved name `guest`, or two different passwords. It needs `Content-Type: application/json`. The audit log records
+`ACCOUNT_CREATED` with details `{"via": "first_run_setup"}` and `LOGIN`.
+
+`POST /auth/guest` (public, JSON body `{}`) exists only with `ALLOW_GUEST=true` in accounts mode; otherwise it answers `404`. It returns
+`{"authenticated": true, "mode": "accounts", "name": "guest", "role": "viewer", "guest": true, "csrf_token", ...}` and sets the usual
+session cookie. The guest has no account row. It can call every route that needs only the `viewer` role and gets `403` on every other one,
+including `/auth/users` and `/auth/password`. `LOGIN` and `LOGOUT` are audited with actor `guest`.
+
+`GET /auth/users` (approver) returns a list of `{"username", "role", "is_active", "created_at"}`, ordered by username.
+
+`POST /auth/users` (approver) takes `{"username", "role", "password"}`. The username is trimmed and lower-cased (3 to 64 characters:
+letters, digits, ".", "-", "_"); the role is `viewer`, `analyst` or `approver`; the password has 12 to 1024 characters. It answers
+`201` with the account record, `409` `"That username already exists."`, or `422` with the reason.
+
+`POST /auth/users/{username}/disable` and `/enable` (approver) answer with the account record. Disabling ends every open session of the
+account. Asking for the state the account already has changes nothing. `409` is returned when you try to disable your own account or
+the last active approver, `404` for an unknown name.
+
+`POST /auth/users/{username}/password` (approver) takes `{"new_password"}` for another account and answers
+`{"status": "ok", "sessions_ended": N}`. Every open session of that account ends, its sign-in lockout is cleared and the old password
+stops working. The new password follows the account rules (`422`). `409` is returned for the approver's own account (use
+`/auth/password`), `404` for an unknown name. A disabled account can be reset and stays disabled.
+
+`POST /auth/password` (any signed-in account) takes `{"current_password", "new_password"}`. A wrong current password is `401` and counts
+towards the same lockout as a wrong sign-in (`429` once locked). The new password follows the rules above and must differ from the
+current one (`422`). On success it answers `{"status": "ok", "other_sessions_ended": N}`: every other session of the account ends, and the
+session that made the change stays open.
+
+No response, log or audit entry contains a password or a password hash, and a `422` from any `/auth/...` route never repeats the
+submitted values. The audit log records `ACCOUNT_CREATED`, `ACCOUNT_DISABLED`, `ACCOUNT_ENABLED` (actor: the approver; target: the
+account), `PASSWORD_CHANGED` (actor and target: the account) and `PASSWORD_RESET` (actor: the approver; target: the account; details
+`{"sessions_ended": N}`). All of them, with `LOGIN`, `LOGIN_FAILED`, `LOGIN_LOCKED` and `LOGOUT`, are returned by
+`GET /audit-logs?category=authentication`.
 
 ## Alerts
 
