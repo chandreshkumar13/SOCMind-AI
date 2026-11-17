@@ -6,11 +6,15 @@ Base URL: `http://localhost:8000/api/v1`. Interactive documentation generated fr
 - All bodies are JSON. All timestamps are UTC, rendered like `2026-09-03T08:14:00Z`.
 - **Authentication is off by default** (`AUTH_MODE=disabled`, demo mode): reviewer / actor names are free text supplied by
   the caller. With `AUTH_MODE=token`, every request needs `Authorization: Bearer <token>`, the role decides what the caller
-  may do, and the reviewer is the token's name. See [SECURITY.md](SECURITY.md).
-  - `401 Unauthorized`: no or unknown token. `403 Forbidden`: a known token whose role is too low.
+  may do, and the reviewer is the token's name. With `AUTH_MODE=accounts`, people sign in with `POST /auth/login` (username and
+  password) and then use an HttpOnly session cookie; each POST, PUT, PATCH or DELETE made with the cookie must send the session's
+  CSRF token in the `X-CSRF-Token` header, and the reviewer is the account's name. Static tokens still work in that mode, for
+  automation. See [SECURITY.md](SECURITY.md).
+  - `401 Unauthorized`: no or unknown token, or (accounts mode) not signed in. `403 Forbidden`: a known token or account whose
+    role is too low, or a cookie write without the CSRF token.
   - Roles: **viewer** (read), **analyst** (ingest, triage, enrich, close, seed, pipeline, correlate, investigate,
     recommend, simulate), **approver** (approve, reject).
-  - `GET /auth/me` returns the caller's `mode`, `authenticated`, `name` and `role`.
+  - `GET /auth/me` returns the caller's `mode`, `authenticated`, `name` and `role` (and, for a cookie session, the CSRF token).
 - **List totals.** `GET /alerts` and `GET /incidents` set the `X-Total-Count` header to the number of records matching the
   filters (not just this page). The header is exposed to browsers through CORS.
 - Errors: `{"detail": "..."}` for 404 / 409 / 422 / 502. Unexpected server errors return HTTP 500 with a generic
@@ -22,6 +26,9 @@ Base URL: `http://localhost:8000/api/v1`. Interactive documentation generated fr
 | --- | --- | --- |
 | GET | `/health` | Liveness, environment, database **engine** (never the connection string). Public (no token). |
 | GET | `/auth/me` | Who the caller is: mode, name and role |
+| GET | `/auth/status` | How the server signs people in (`mode`, `login_required`, `sign_in`). Public |
+| POST | `/auth/login` | Accounts mode only (404 in other modes). JSON body with `username` and `password`: sets the session cookie and returns the CSRF token. `401` for wrong credentials, `429` while locked out |
+| POST | `/auth/logout` | End the current session (a cookie session sends `X-CSRF-Token`) |
 | GET | `/version` | Version and runtime information |
 | GET | `/config` | Non-secret runtime configuration (threat-intel mode, execution mode, authentication status) |
 | GET | `/stats` | True totals computed in the database (alerts by severity/status, incidents, awaiting review, audit count) |
@@ -223,7 +230,7 @@ Response (abridged):
   (`mode`: `mock` / `live` / `unavailable`, `requested_provider`, `active_provider`, `fallback_reason`,
   `live_provider_implemented: true`, `live_provider_active`, and a `virustotal` object with `api_key_configured`
   (yes/no only), the limits, `url_lookups: "disabled"` and the rolling `quota` when live mode is active), `llm` (`used_by_agents: false`),
-  `authentication` (`mode`, `enabled` = `AUTH_MODE` is `token`), the log source and sample-data paths. It contains no secrets
+  `authentication` (`mode`, `enabled` = `AUTH_MODE` is `token` or `accounts`), the log source and sample-data paths. It contains no secrets
   and never a token.
 - `GET /audit-logs` → `[{"id", "timestamp", "actor", "action", "target_id", "details"}]`, newest first; `action`
   filters are upper-cased.

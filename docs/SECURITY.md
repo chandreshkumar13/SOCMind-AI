@@ -6,7 +6,7 @@ alerts or logs. This document says what protects the API today and what does not
 
 ## Authentication and roles
 
-Two modes, chosen with `AUTH_MODE`:
+Three modes, chosen with `AUTH_MODE`:
 
 | Mode | Who can call the API | Reviewer name |
 | --- | --- | --- |
@@ -24,9 +24,12 @@ Roles are ordered: **viewer < analyst < approver**.
 
 Responses:
 
-- `401 Unauthorized`: no token, a malformed header, or a token that is not in `AUTH_TOKENS`. The message never repeats the token.
-- `403 Forbidden`: a known token whose role is too low for the action.
-- `GET /api/v1/auth/me` tells a caller its mode, name and role. `GET /api/v1/health` and `GET /api/v1/version` stay public.
+- `401 Unauthorized`: no token, a malformed header, or a token that is not in `AUTH_TOKENS`. In accounts mode, also no valid
+  session (`Sign in to continue.`). The message never repeats the token.
+- `403 Forbidden`: a known token (or signed-in account) whose role is too low for the action, or, for a cookie session, a write
+  without the right CSRF token.
+- `GET /api/v1/auth/me` tells a caller its mode, name and role. `GET /api/v1/auth/status` (how the server signs people in),
+  `GET /api/v1/health` and `GET /api/v1/version` stay public.
 
 Token rules, enforced at startup (`app/core/auth.py`):
 
@@ -113,14 +116,16 @@ Known limits of accounts mode:
 ## What is not protected
 
 - **Demo mode has no authentication.** Do not run `AUTH_MODE=disabled` anywhere reachable by untrusted people.
-- **Documentation is public.** `/docs`, `/redoc` and `/api/v1/openapi.json` describe the API but return no data, in both modes.
+- **Documentation is public.** `/docs`, `/redoc` and `/api/v1/openapi.json` describe the API but return no data, in every mode.
 - **Process-local limits.** More than one worker process gives each its own run lock, VirusTotal quota, cache and circuit
   breaker, so limits are not shared. Run one worker. A startup warning is logged when `WEB_CONCURRENCY` is above 1.
-- **Tokens are static.** There is no login, no expiry, no revocation without a restart, and no per-user audit beyond the
-  token name. Rotating a token means editing `AUTH_TOKENS` and restarting the backend.
+- **Tokens are static.** A token has no sign-in step, no expiry, no revocation without a restart, and no per-user audit beyond
+  the token name. Rotating a token means editing `AUTH_TOKENS` and restarting the backend. Use accounts mode for people who
+  sign in.
 - **Traffic is not encrypted by the application.** Use HTTPS in front of the API (a reverse proxy) if tokens cross a network.
-- **No rate limiting** on login-free API calls, and no request signing.
-- **The frontend is not a security boundary.** Role checks happen in the backend; the page only shows the token field.
+- **No general rate limiting** on API calls (the only limit is the sign-in lockout in accounts mode), and no request signing.
+- **The frontend is not a security boundary.** Role checks happen in the backend; the page only shows the token field or the
+  sign-in page.
 - **Token mode has not been tested against a real identity provider.** Only the test suite (`backend/tests/test_auth.py`)
   exercises it.
 

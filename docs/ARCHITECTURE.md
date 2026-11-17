@@ -204,8 +204,8 @@ render timestamps as ISO-8601 with a `Z` suffix. The UI labels times "UTC".
 ## Frontend
 
 React 18 + Vite. `src/api.js` is the only place that calls the backend; it turns HTTP errors into readable messages.
-Pages: Dashboard, Security Alerts, Correlated Incidents, Agent Pipeline, Audit Log, Settings (read-only view of
-`GET /config`). Pure helpers live in `src/lib/view.js` (unit tested); `src/lib/useAsync.js` provides loading / error /
+Pages: Dashboard, Security Alerts (severity and status filters, search, close), Correlated Incidents (search, filter, sort), Agent Pipeline, Audit Log (CSV export), Login (accounts mode), Settings (read-only view of
+`GET /config`). Pure helpers live in `src/lib/` (`view.js`, `alertFilters.js`, `incidentFilters.js`, `auditCsv.js`, `session.js`; unit tested); `src/lib/useAsync.js` provides loading / error /
 data state. Every list has loading, error and empty states. Sample data is only loaded when the analyst presses
 "Load sample (synthetic) alerts".
 
@@ -213,7 +213,10 @@ data state. Every list has loading, error and empty states. Sample data is only 
 
 | Module | Role |
 | --- | --- |
-| `app/core/auth.py` | Bearer-token check, roles (viewer < analyst < approver), startup validation of the token configuration |
+| `app/core/auth.py` | Three modes (`disabled`, `token`, `accounts`), roles (viewer < analyst < approver), cookie-session and CSRF checks, startup validation of the auth configuration |
+| `app/services/accounts.py`, `app/services/passwords.py` | Sign-in accounts: sessions, lockout and scrypt password hashing |
+| `app/models/auth_models.py` | The `user_accounts`, `auth_sessions` and `login_attempts` tables |
+| `app/cli/accounts.py` | Command line to create and manage accounts (`python -m app.cli.accounts`) |
 | `app/core/clock.py` | The one clock for stored timestamps (naive UTC, through the timezone-aware API) |
 | `app/agents/text_match.py` | Whole-term keyword matching shared by triage, investigation and response (`c2` does not match `ec2`) |
 | `app/agents/enrichment/encoded_commands.py` | Read-only decoding of base64 PowerShell payloads; never executes |

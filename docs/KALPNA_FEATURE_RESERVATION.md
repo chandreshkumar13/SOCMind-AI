@@ -1,5 +1,7 @@
 # Reserved feature for Kalpna Chaudhary: Incident list search, filtering and sorting
 
+> **Status: implemented.** The incident list search, filtering and sorting described below now exists in `frontend/src/lib/incidentFilters.js` (`filterAndSortIncidents`) and is used by `frontend/src/pages/Incidents.jsx`. The rest of this document is the original specification, left as it was written when the feature was reserved, so its wording below ("reserved", "NOT implemented") is historical. It was implemented by Chandresh Kumar (commit `5ba6f8a`, PR #2); see "Team contributions" in the README.
+
 **Status: reserved and NOT implemented.** Nothing for this feature has been started on any branch. The rest of the
 application is complete and does not depend on it.
 
