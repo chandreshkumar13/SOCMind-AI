@@ -141,12 +141,19 @@ export function simulationState(incident) {
   return { canSimulate: true, simulated: false, reason: '' };
 }
 
+/** The event types the Audit Log can be narrowed to. '' means every event. */
+export const AUDIT_CATEGORIES = [
+  { value: '', label: 'All events' },
+  { value: 'authentication', label: 'Authentication events' },
+];
+
 /** Query string for GET /audit-logs; empty filters are left out and the action is upper-cased as the API expects. */
-export function auditQuery({ actor = '', action = '', target = '', limit = 50, offset = 0 } = {}) {
+export function auditQuery({ actor = '', action = '', target = '', category = '', limit = 50, offset = 0 } = {}) {
   const params = new URLSearchParams();
   if (actor.trim()) params.set('actor', actor.trim());
   if (action.trim()) params.set('action', action.trim().toUpperCase());
   if (target.trim()) params.set('target_id', target.trim());
+  if (AUDIT_CATEGORIES.some((c) => c.value && c.value === category)) params.set('category', category);
   params.set('limit', String(limit));
   params.set('offset', String(offset));
   return `?${params.toString()}`;

@@ -21,8 +21,14 @@ services:
       # development (default) allows demo mode. Any other value needs AUTH_MODE=token (app/core/auth.py enforces this).
       - ENVIRONMENT=${SOCMIND_ENVIRONMENT:-development}
       # disabled (default) = demo mode, no token. token = every request needs a bearer token from AUTH_TOKENS.
+      # accounts = people sign in with a username and password (not tried in Docker; see the README).
       - AUTH_MODE=${AUTH_MODE:-disabled}
       - AUTH_TOKENS=${AUTH_TOKENS:-[]}
+      # Accounts mode only. The defaults are the application's own (app/core/config.py).
+      - SESSION_IDLE_MINUTES=${SESSION_IDLE_MINUTES:-30}
+      - SESSION_ABSOLUTE_HOURS=${SESSION_ABSOLUTE_HOURS:-8}
+      - LOGIN_MAX_FAILURES=${LOGIN_MAX_FAILURES:-5}
+      - LOGIN_LOCK_MINUTES=${LOGIN_LOCK_MINUTES:-15}
       # SQLite database in the named volume socmind-db (created as user socmind, see backend/Dockerfile)
       - DATABASE_URL=sqlite:////app/data/socmind.db
       - CORS_ORIGINS=["http://localhost:5173","http://localhost:3000"]

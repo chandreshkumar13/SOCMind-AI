@@ -207,6 +207,14 @@ def test_compose_does_not_mount_source_code_over_the_image():
     assert "./backend:/app" not in _compose()
 
 
+def test_compose_passes_the_accounts_mode_settings_with_the_application_defaults():
+    from app.core.config import Settings
+    text = _compose()
+    for name in ("SESSION_IDLE_MINUTES", "SESSION_ABSOLUTE_HOURS", "LOGIN_MAX_FAILURES", "LOGIN_LOCK_MINUTES"):
+        default = Settings.model_fields[name].default
+        assert f"- {name}=${{{name}:-{default}}}" in text, name
+
+
 def test_compose_keeps_the_sqlite_database_in_a_named_volume_inside_the_data_directory():
     import re
     text = _compose()

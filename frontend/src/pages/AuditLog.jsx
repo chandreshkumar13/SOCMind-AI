@@ -2,7 +2,7 @@ import React, { useCallback, useEffect, useState } from 'react';
 import { Download, RefreshCw } from 'lucide-react';
 import { ActionButton, EmptyCard, ErrorCard, LoadingCard } from '../components/StateCards';
 import { api } from '../api';
-import { auditQuery, formatUtc, previewDetails } from '../lib/view';
+import { AUDIT_CATEGORIES, auditQuery, formatUtc, previewDetails } from '../lib/view';
 import { auditCsvBlob, auditExportFilename, auditExportNote, downloadBlob } from '../lib/auditCsv';
 import { beginRequest, createRequestGate, initialList, receive } from '../lib/auditLoad';
 
@@ -11,7 +11,7 @@ const input = { padding: '8px 10px', borderRadius: 'var(--radius-sm)', border: '
 
 /** Read-only view of GET /audit-logs: who did what to which alert or incident, newest first. */
 export default function AuditLog() {
-  const [filters, setFilters] = useState({ actor: '', action: '', target: '' });
+  const [filters, setFilters] = useState({ actor: '', action: '', target: '', category: '' });
   const [applied, setApplied] = useState(filters);
   const [list, setList] = useState(initialList);
   const [gate] = useState(createRequestGate);       // numbers the requests; only the newest may change the list
@@ -42,8 +42,11 @@ export default function AuditLog() {
         <input style={input} placeholder="Actor (exact), e.g. Triage Agent" value={filters.actor} onChange={set('actor')} />
         <input style={input} placeholder="Action, e.g. INCIDENT_APPROVED" value={filters.action} onChange={set('action')} />
         <input style={input} placeholder="Target id, e.g. INC-2026-001" value={filters.target} onChange={set('target')} />
+        <select style={input} aria-label="Filter by event type" value={filters.category} onChange={set('category')}>
+          {AUDIT_CATEGORIES.map((c) => <option key={c.value || 'all'} value={c.value}>{c.label}</option>)}
+        </select>
         <ActionButton onClick={apply}>Apply filters</ActionButton>
-        <ActionButton variant="ghost" onClick={() => { const empty = { actor: '', action: '', target: '' }; setFilters(empty); setApplied(empty); }}>Clear</ActionButton>
+        <ActionButton variant="ghost" onClick={() => { const empty = { actor: '', action: '', target: '', category: '' }; setFilters(empty); setApplied(empty); }}>Clear</ActionButton>
         <ActionButton variant="ghost" onClick={() => load(applied, 0)}><RefreshCw size={12} style={{ verticalAlign: '-2px' }} /> Refresh</ActionButton>
       </form>
 

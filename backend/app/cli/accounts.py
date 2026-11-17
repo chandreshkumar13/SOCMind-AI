@@ -3,6 +3,7 @@
     python -m app.cli.accounts create-user --username NAME --role viewer|analyst|approver
     python -m app.cli.accounts disable-user --username NAME
     python -m app.cli.accounts enable-user --username NAME
+    python -m app.cli.accounts reset-password --username NAME
     python -m app.cli.accounts list-users
 
 Passwords are read with getpass, twice, and are never accepted as a command-line argument, from a file or from an environment
@@ -29,6 +30,8 @@ def build_parser() -> argparse.ArgumentParser:
     for name, text in (("disable-user", "disable an account and end its sessions"), ("enable-user", "enable a disabled account")):
         sub = commands.add_parser(name, help=text)
         sub.add_argument("--username", required=True)
+    reset = commands.add_parser("reset-password", help="set a new password for an account and end its sessions (asked for, not passed)")
+    reset.add_argument("--username", required=True)
     commands.add_parser("list-users", help="list accounts (no password data)")
     return parser
 
@@ -48,6 +51,15 @@ def main(argv: Optional[Sequence[str]] = None,
                 return 2
             user = accounts.create_user(db, args.username, args.role, password)
             out(f"Created the {user.role} account '{user.username}'.")
+            return 0
+        if args.command == "reset-password":
+            password = read_password("New password: ")
+            if read_password("Repeat new password: ") != password:
+                err("The two passwords do not match. The password was not changed.")
+                return 2
+            user, ended = accounts.reset_password(db, None, args.username, password)
+            db.commit()
+            out(f"The password of '{user.username}' was changed. {ended} open session{'' if ended == 1 else 's'} ended.")
             return 0
         if args.command in ("disable-user", "enable-user"):
             user = accounts.set_active(db, args.username, active=args.command == "enable-user")

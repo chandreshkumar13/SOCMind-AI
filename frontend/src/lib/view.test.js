@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
   describeError, groupFindings, reputationKey, statusLabel, reviewState, formatUtc, summarizeRun, runBadgeKey, stageBadgeKey,
-  simulationState, auditQuery, previewDetails, truncationNote,
+  simulationState, auditQuery, AUDIT_CATEGORIES, previewDetails, truncationNote,
   reputationSource, lookupStatusLabel, isRetryableLookup, detectionLabel, safeVirusTotalUrl, enrichmentNotices,
   intelSource, refreshedSelection, alertSearchPath, searchCapNote, fetchAlertSearch,
   recommendationView, reinvestigationNotice,
@@ -356,4 +356,22 @@ test('the stale notice takes the superseded state from recommendationView (wirin
   const { readFileSync } = await import('node:fs');
   const source = readFileSync(new URL('../components/StaleNotice.jsx', import.meta.url), 'utf8');
   assert.match(source, /recommendationView\(details\)/);
+});
+
+test('auditQuery adds the authentication category only when it is chosen, and ignores anything else', () => {
+  assert.equal(auditQuery({ category: 'authentication' }), '?category=authentication&limit=50&offset=0');
+  assert.equal(auditQuery({ action: 'login', category: 'authentication', limit: 20 }), '?action=LOGIN&category=authentication&limit=20&offset=0');
+  assert.equal(auditQuery({ category: '' }), '?limit=50&offset=0');
+  assert.equal(auditQuery({ category: 'everything' }), '?limit=50&offset=0', 'an unknown category is never sent');
+  assert.deepEqual(AUDIT_CATEGORIES.map((c) => c.value), ['', 'authentication']);
+  assert.deepEqual(AUDIT_CATEGORIES.map((c) => c.label), ['All events', 'Authentication events']);
+});
+
+test('the Audit Log page offers the event-type filter, applies it with the other filters and clears it', async () => {
+  const { readFileSync } = await import('node:fs');
+  const page = readFileSync(new URL('../pages/AuditLog.jsx', import.meta.url), 'utf8').replace(/\r\n/g, '\n');
+  assert.match(page, /aria-label="Filter by event type"/);
+  assert.match(page, /AUDIT_CATEGORIES\.map/);
+  assert.match(page, /useState\(\{ actor: '', action: '', target: '', category: '' \}\)/);
+  assert.match(page, /const empty = \{ actor: '', action: '', target: '', category: '' \};/);
 });

@@ -2,8 +2,9 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import {
-  canSubmitSignIn, identityLabel, isWriteMethod, requestHeaders, roleLabel, settingsAccessView, signInErrorMessage,
-  signInRequired, signOutOutcome, signedOutAfter,
+  ABSOLUTE_WARNING_SECONDS, IDLE_WARNING_SECONDS, absoluteDeadline, canSubmitSignIn, countsAsActivity, formatCountdown, identityLabel,
+  isWriteMethod, requestHeaders, roleLabel, sessionWarning, sessionWarningMessage, settingsAccessView, signInErrorMessage,
+  signInRequired, signOutOutcome, signedOutAfter, warningCanBeExtended,
 } from './session.js';
 
 // Reads a source file for the wiring checks. Line endings are normalised so the patterns below match on every platform.
@@ -173,7 +174,8 @@ test('the app loads nothing until sign-in is confirmed, and clears the data when
   const app = src('../App.jsx');
   assert.match(app, /if \(auth\.phase === 'ready'\) refreshAll\(\);/);
   assert.doesNotMatch(app, /useEffect\(\(\) => \{\n\s*refreshAll\(\);\n\s*\}, \[refreshAll\]\)/, 'refreshAll must not run on mount unconditionally');
-  assert.match(app, /if \(auth\.phase === 'signin'\) return <Login onSignedIn=\{handleSignedIn\} \/>;/);
+  assert.match(app, /if \(auth\.phase === 'signin'\) return <Login onSignedIn=\{handleSignedIn\} guestAllowed=\{auth\.guestAllowed\} \/>;/);
+  assert.match(app, /if \(auth\.phase === 'setup'\) return <Setup onSignedIn=\{handleSignedIn\} \/>;/);
   assert.match(app, /window\.addEventListener\(SIGNED_OUT_EVENT, onSignedOut\)/);
   assert.match(app, /await api\('\/auth\/logout', \{ method: 'POST' \}\)/);
 });
@@ -207,4 +209,143 @@ test('the top bar no longer shows a hard-coded person (wiring guard)', () => {
   assert.doesNotMatch(topbar, /Chandresh|Lead SOC Analyst/);
   assert.match(topbar, /identityLabel\(user, mode\)/);
   assert.match(topbar, /onSignOut && user &&/, 'the sign-out control appears only for a real session');
+});
+
+// ----------------------------------------------------------------------------------- session expiry warning
+const T = 1_700_000_000_000;                  // an arbitrary "now" in milliseconds
+const MIN = 60_000;
+const HOUR = 60 * MIN;
+const idleWarning = (nowAfterActivity, extra = {}) =>
+  sessionWarning({ now: T + nowAfterActivity, lastActivityAt: T, idleTimeoutMinutes: 30, ...extra });
+
+test('the warning limits are two minutes before the idle timeout and five before the absolute limit', () => {
+  assert.equal(IDLE_WARNING_SECONDS, 120);
+  assert.equal(ABSOLUTE_WARNING_SECONDS, 300);
+});
+
+test('no warning while there is plenty of idle time left', () => {
+  assert.deepEqual(idleWarning(0), { kind: null, secondsLeft: null });
+  assert.deepEqual(idleWarning(27 * MIN), { kind: null, secondsLeft: null }, 'three minutes left is not yet a warning');
+});
+
+test('two minutes before the idle timeout the warning appears, and says so in words', () => {
+  const warning = idleWarning(28 * MIN);
+  assert.deepEqual(warning, { kind: 'idle', secondsLeft: 120 });
+  assert.equal(sessionWarningMessage(warning), 'Your session will end in 2 minutes due to inactivity.');
+  assert.equal(sessionWarningMessage(idleWarning(29 * MIN + 30_000)), 'Your session will end in 30 seconds due to inactivity.');
+  assert.equal(sessionWarningMessage(idleWarning(29 * MIN)), 'Your session will end in 1 minute due to inactivity.');
+});
+
+test('a second before the warning window there is still nothing, and a second into it there is', () => {
+  assert.equal(idleWarning(28 * MIN - 1000).kind, null);
+  assert.equal(idleWarning(28 * MIN + 1000).kind, 'idle');
+  assert.equal(idleWarning(28 * MIN + 1000).secondsLeft, 119);
+});
+
+test('when the time has passed the session is reported as expired', () => {
+  assert.deepEqual(idleWarning(30 * MIN), { kind: 'expired', secondsLeft: 0 });
+  assert.deepEqual(idleWarning(31 * MIN), { kind: 'expired', secondsLeft: 0 });
+  assert.equal(sessionWarningMessage({ kind: 'expired', secondsLeft: 0 }), 'Your session has ended.');
+});
+
+test('using the session restarts the idle clock, so the warning goes away', () => {
+  assert.equal(idleWarning(29 * MIN).kind, 'idle');
+  const afterActivity = sessionWarning({ now: T + 29 * MIN, lastActivityAt: T + 29 * MIN, idleTimeoutMinutes: 30 });
+  assert.equal(afterActivity.kind, null);
+});
+
+test('five minutes before the absolute limit a notice appears, and it cannot be extended', () => {
+  const deadline = T + 8 * HOUR;
+  const base = { lastActivityAt: T + 8 * HOUR - 5 * MIN, idleTimeoutMinutes: 30, absoluteDeadlineAt: deadline };
+  assert.equal(sessionWarning({ ...base, now: deadline - 6 * MIN }).kind, null);
+  const warning = sessionWarning({ ...base, now: deadline - 5 * MIN });
+  assert.deepEqual(warning, { kind: 'absolute', secondsLeft: 300 });
+  assert.match(sessionWarningMessage(warning), /^Your session reaches its time limit in 5 minutes\./);
+  assert.equal(warningCanBeExtended(warning), false);
+  assert.equal(sessionWarning({ ...base, now: deadline + 1 }).kind, 'expired');
+});
+
+test('Stay signed in is offered for the idle warning only', () => {
+  assert.equal(warningCanBeExtended({ kind: 'idle', secondsLeft: 100 }), true);
+  assert.equal(warningCanBeExtended({ kind: 'absolute', secondsLeft: 100 }), false);
+  assert.equal(warningCanBeExtended({ kind: 'expired', secondsLeft: 0 }), false);
+  assert.equal(warningCanBeExtended({ kind: null }), false);
+  assert.equal(warningCanBeExtended(null), false);
+});
+
+test('when both limits are near, the one that comes first is reported', () => {
+  const now = T + 8 * HOUR - 4 * MIN;
+  const at = (idleLeftSeconds, absoluteLeftSeconds) => sessionWarning({
+    now, lastActivityAt: now - (30 * MIN - idleLeftSeconds * 1000), idleTimeoutMinutes: 30, absoluteDeadlineAt: now + absoluteLeftSeconds * 1000,
+  });
+  assert.equal(at(100, 200).kind, 'idle', 'idle ends first: staying signed in still helps');
+  assert.equal(at(100, 60).kind, 'absolute', 'the absolute limit ends first: nothing helps');
+  assert.equal(at(200, 250).kind, 'absolute', 'idle is not near, the absolute limit is');
+  assert.equal(at(1000, 1000).kind, null);
+  assert.equal(at(0, 500).kind, 'expired');
+});
+
+test('missing or broken timing says nothing instead of guessing', () => {
+  assert.deepEqual(sessionWarning(), { kind: null, secondsLeft: null });
+  assert.deepEqual(sessionWarning({}), { kind: null, secondsLeft: null });
+  assert.deepEqual(sessionWarning({ now: Number.NaN, lastActivityAt: T, idleTimeoutMinutes: 30 }), { kind: null, secondsLeft: null });
+  assert.deepEqual(sessionWarning({ now: T, idleTimeoutMinutes: 30 }), { kind: null, secondsLeft: null }, 'no known activity time');
+  assert.deepEqual(sessionWarning({ now: T, lastActivityAt: T }), { kind: null, secondsLeft: null }, 'no idle timeout given');
+  assert.equal(sessionWarningMessage({ kind: null }), '');
+  assert.equal(sessionWarningMessage(null), '');
+});
+
+test('the absolute limit comes from the seconds the server reports, not from this computer\'s idea of the time', () => {
+  assert.equal(absoluteDeadline({ expires_in_seconds: 600 }, T), T + 600_000);
+  assert.equal(absoluteDeadline({ expires_in_seconds: 0 }, T), T);
+  for (const bad of [null, undefined, {}, { expires_in_seconds: null }, { expires_in_seconds: -1 }, { expires_in_seconds: 'soon' }]) {
+    assert.equal(absoluteDeadline(bad, T), null, JSON.stringify(bad));
+  }
+  assert.equal(absoluteDeadline({ expires_in_seconds: 600 }, Number.NaN), null);
+});
+
+test('a countdown is written in words and rounded up', () => {
+  assert.equal(formatCountdown(120), '2 minutes');
+  assert.equal(formatCountdown(119), '2 minutes');
+  assert.equal(formatCountdown(61), '2 minutes');
+  assert.equal(formatCountdown(60), '1 minute');
+  assert.equal(formatCountdown(59), '59 seconds');
+  assert.equal(formatCountdown(1), '1 second');
+  assert.equal(formatCountdown(0.2), '1 second');
+  assert.equal(formatCountdown(0), '0 seconds');
+  assert.equal(formatCountdown(-5), '0 seconds');
+  assert.equal(formatCountdown('soon'), '0 seconds');
+});
+
+test('only answers that used the account session restart the idle clock', () => {
+  assert.equal(countsAsActivity({ mode: 'accounts', status: 200, path: '/alerts?limit=100' }), true);
+  assert.equal(countsAsActivity({ mode: 'accounts', status: 200, path: '/auth/me' }), true);
+  assert.equal(countsAsActivity({ mode: 'accounts', status: 409, path: '/auth/users/ana/disable' }), true);
+  assert.equal(countsAsActivity({ mode: 'accounts', status: 403, path: '/alerts/seed' }), true, 'the server saw the session before refusing');
+  assert.equal(countsAsActivity({ mode: 'accounts', status: 401, path: '/alerts' }), false);
+  assert.equal(countsAsActivity({ mode: 'accounts', status: 0, path: '/alerts' }), false);
+  assert.equal(countsAsActivity({ mode: 'accounts', status: 200, path: '/auth/status' }), false);
+  assert.equal(countsAsActivity({ mode: 'accounts', status: 200, path: '/auth/login' }), false);
+  assert.equal(countsAsActivity({ mode: 'token', status: 200, path: '/alerts' }), false);
+  assert.equal(countsAsActivity({ mode: 'disabled', status: 200, path: '/alerts' }), false);
+});
+
+test('a refused password change is an ordinary 401, not the end of the session', () => {
+  assert.equal(signedOutAfter({ mode: 'accounts', status: 401, path: '/auth/password' }), false);
+  assert.equal(signedOutAfter({ mode: 'accounts', status: 401, path: '/auth/users' }), true);
+  assert.equal(signedOutAfter({ mode: 'accounts', status: 401, path: '/alerts' }), true);
+});
+
+test('the page wires the warning to the session: activity is noted in api.js and the notice is shown only to a signed-in account', () => {
+  const api = src('../api.js');
+  assert.match(api, /if \(countsAsActivity\(\{ mode: authMode, status: res\.status, path \}\)\) lastActivityAt = Date\.now\(\);/);
+  const app = src('../App.jsx');
+  assert.match(app, /\{auth\.signInRequired && auth\.user && <SessionNotice session=\{auth\.user\} \/>\}/);
+  assert.match(app, /noteActivity\(\);\s+\/\/ signing in starts the idle clock/);
+  assert.equal((app.match(/receivedAt: Date\.now\(\)/g) || []).length, 2, 'both ways of getting a session record when its timing arrived');
+  const notice = src('../components/SessionNotice.jsx');
+  assert.match(notice, /Stay signed in/);
+  assert.match(notice, /sessionWarning\(\{/);
+  assert.match(notice, /api\('\/auth\/me'\)/, 'the light authenticated request that refreshes the session');
+  assert.match(notice, /warningCanBeExtended\(warning\) && <ActionButton/);
 });

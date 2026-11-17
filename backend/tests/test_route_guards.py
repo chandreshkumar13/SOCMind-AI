@@ -15,7 +15,16 @@ EXPECTED = {
     ("GET", "/api/v1/auth/me"): "viewer",
     ("GET", "/api/v1/auth/status"): None,
     ("POST", "/api/v1/auth/login"): None,
+    ("POST", "/api/v1/auth/setup"): None,       # accounts mode only, and only while no account exists (409 afterwards)
+    ("POST", "/api/v1/auth/guest"): None,       # accounts mode only, and only with ALLOW_GUEST (404 otherwise)
     ("POST", "/api/v1/auth/logout"): "viewer",
+    # accounts mode only (404 in the other modes); the role check still comes first, so 401 and 403 hold in every mode
+    ("GET", "/api/v1/auth/users"): "approver",
+    ("POST", "/api/v1/auth/users"): "approver",
+    ("POST", "/api/v1/auth/users/{username}/disable"): "approver",
+    ("POST", "/api/v1/auth/users/{username}/enable"): "approver",
+    ("POST", "/api/v1/auth/users/{username}/password"): "approver",
+    ("POST", "/api/v1/auth/password"): "viewer",
     ("POST", "/api/v1/alerts"): "analyst",
     ("GET", "/api/v1/alerts"): "viewer",
     ("GET", "/api/v1/alerts/{alert_id}"): "viewer",
@@ -57,7 +66,7 @@ def _api_routes():
 
 
 def _concrete(path):
-    return path.replace("{alert_id}", "NO-SUCH-ALERT").replace("{incident_id}", "NO-SUCH-INCIDENT")
+    return path.replace("{alert_id}", "NO-SUCH-ALERT").replace("{incident_id}", "NO-SUCH-INCIDENT").replace("{username}", "no.such.user")
 
 
 @pytest.fixture
